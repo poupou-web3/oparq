@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import tomllib
 import unittest
 from urllib.parse import unquote, urlsplit
 
@@ -19,6 +20,8 @@ PAGES = ("quickstart.md", "cloud-storage.md", "compression.md", "algorithms.md",
 MAINTAINED = ("README.md", "CONTRIBUTING.md", "CHANGELOG.md", "benchmarks/README.md",
               *("docs/" + name for name in PAGES))
 LINK = re.compile(r"\[[^\]]*\]\(([^\s)]+)(?:\s+\"[^\"]*\")?\)")
+# README links are absolute so they also work on PyPI.
+REPOSITORY_FILE = re.compile(r"https://github\.com/poupou-web3/oparq/(?:blob|tree)/main/([^#?]+)")
 
 
 class DocumentationTests(unittest.TestCase):
@@ -27,18 +30,32 @@ class DocumentationTests(unittest.TestCase):
                   ("*.md", "docs/**/*.md", "benchmarks/**/*.md") for path in ROOT.glob(pattern)}
         self.assertEqual(actual, set(MAINTAINED))
 
-    def test_relative_links_resolve_inside_the_repository(self):
+    def test_links_resolve_inside_the_repository(self):
         for name in MAINTAINED:
             source = ROOT / name
             text = source.read_text()
             self.assertNotIn("/Users/admin/", text)
             for link in LINK.findall(text):
                 parsed = urlsplit(link)
-                if parsed.scheme or parsed.netloc or not parsed.path:
+                repository_file = REPOSITORY_FILE.fullmatch(link)
+                if repository_file:
+                    target = ROOT / unquote(repository_file.group(1))
+                elif parsed.scheme or parsed.netloc or not parsed.path:
                     continue
-                target = (source.parent / unquote(parsed.path)).resolve()
+                else:
+                    target = (source.parent / unquote(parsed.path)).resolve()
                 with self.subTest(page=name, link=link):
                     self.assertTrue(target.is_relative_to(ROOT) and target.exists())
+
+    def test_project_urls_name_existing_repository_files(self):
+        with (ROOT / "pyproject.toml").open("rb") as stream:
+            urls = tomllib.load(stream)["project"]["urls"]
+        self.assertIn("Repository", urls)
+        for label, url in urls.items():
+            repository_file = REPOSITORY_FILE.fullmatch(url)
+            if repository_file:
+                with self.subTest(label=label):
+                    self.assertTrue((ROOT / repository_file.group(1)).exists())
 
     def test_quickstart_python_examples_execute_together(self):
         text = (ROOT / "docs/quickstart.md").read_text()

@@ -111,7 +111,19 @@ Solana 29.64% (33.54% and 43.00% when sorted globally). Arrow was faster in
 that run; DuckDB is retained for bounded-memory execution, not a
 demonstrated universal speed advantage.
 
-The source repository contains the quickstart and API reference in `docs/`,
-and benchmark runners plus machine-readable results in `benchmarks/`.
-The measurements above are from
-historical development runs, not a claim that the original inputs are public.
+The measurements above are from historical development runs, not a claim
+that the original inputs are public. Methodology, regressions, and caveats are
+in [Benchmarks and limitations](https://github.com/poupou-web3/oparq/blob/main/docs/benchmarks.md);
+runners and machine-readable results are in
+[`benchmarks/`](https://github.com/poupou-web3/oparq/tree/main/benchmarks).
+
+## Documentation
+
+- [Installation and quickstart](https://github.com/poupou-web3/oparq/blob/main/docs/quickstart.md)
+- [S3 and GCS bucket rewrites](https://github.com/poupou-web3/oparq/blob/main/docs/cloud-storage.md)
+- [Compression settings and source provenance](https://github.com/poupou-web3/oparq/blob/main/docs/compression.md)
+- [Sorting algorithms](https://github.com/poupou-web3/oparq/blob/main/docs/algorithms.md)
+- [Python API](https://github.com/poupou-web3/oparq/blob/main/docs/api.md) and
+  [command line](https://github.com/poupou-web3/oparq/blob/main/docs/cli.md)
+- [Changelog](https://github.com/poupou-web3/oparq/blob/main/CHANGELOG.md) and
+  [contributing](https://github.com/poupou-web3/oparq/blob/main/CONTRIBUTING.md)
