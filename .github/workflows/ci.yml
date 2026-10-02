@@ -1,0 +1,116 @@
+name: Test and package
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+        extra: [base, duckdb]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.5"
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - name: Install base dependencies
+        if: matrix.extra == 'base'
+        run: uv sync --locked
+      - name: Install optional DuckDB dependencies
+        if: matrix.extra == 'duckdb'
+        run: uv sync --locked --extra duckdb
+      - name: Run tests
+        run: uv run --no-sync python -m unittest discover -s tests -v
+
+  oldest-pyarrow:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The declared minimum, and the first release with Python 3.13 wheels.
+          - python: "3.12"
+            pyarrow: "16.0.0"
+          - python: "3.13"
+            pyarrow: "18.1.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.5"
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - name: Install locked dependencies, then the oldest supported PyArrow
+        run: |
+          uv sync --locked --extra duckdb
+          uv pip install "pyarrow==${{ matrix.pyarrow }}"
+      - name: Run tests
+        run: uv run --no-sync python -m unittest discover -s tests -v
+
+  distributions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.5"
+          python-version: "3.12"
+          enable-cache: true
+      - name: Build and audit wheel and source distribution
+        run: |
+          uv build
+          uv run --no-project python scripts/check_distribution.py
+      - name: Validate PyPI metadata
+        run: uvx --from 'twine>=6,<7' twine check --strict dist/oparq-*.whl dist/oparq-*.tar.gz
+      - name: Rebuild wheel from the source distribution without the checkout
+        shell: bash
+        run: |
+          source_archive=$(find "$GITHUB_WORKSPACE/dist" -maxdepth 1 -name 'oparq-*.tar.gz' -print -quit)
+          rebuilt_directory="$RUNNER_TEMP/oparq-sdist-rebuild"
+          uv build --wheel --out-dir "$rebuilt_directory" "$source_archive"
+          rebuilt_wheel=$(find "$rebuilt_directory" -maxdepth 1 -name 'oparq-*.whl' -print -quit)
+          uv run --no-project python scripts/check_distribution.py "$rebuilt_wheel" "$source_archive"
+      - name: Smoke installed base wheel outside the checkout
+        shell: bash
+        run: |
+          wheel_path=$(find "$GITHUB_WORKSPACE/dist" -maxdepth 1 -name 'oparq-*.whl' -print -quit)
+          smoke_environment="$RUNNER_TEMP/oparq-wheel-smoke"
+          uv venv --python 3.12 "$smoke_environment"
+          uv pip install --python "$smoke_environment/bin/python" "$wheel_path"
+          "$smoke_environment/bin/python" -I "$GITHUB_WORKSPACE/scripts/check_distribution.py" --smoke
+      - name: Smoke the wheel rebuilt from the source distribution
+        shell: bash
+        run: |
+          rebuilt_wheel=$(find "$RUNNER_TEMP/oparq-sdist-rebuild" -maxdepth 1 -name 'oparq-*.whl' -print -quit)
+          smoke_environment="$RUNNER_TEMP/oparq-wheel-smoke"
+          uv pip install --reinstall-package oparq --python "$smoke_environment/bin/python" "$rebuilt_wheel"
+          "$smoke_environment/bin/python" -I "$GITHUB_WORKSPACE/scripts/check_distribution.py" --smoke
+      - name: Smoke installed DuckDB extra
+        shell: bash
+        run: |
+          wheel_path=$(find "$GITHUB_WORKSPACE/dist" -maxdepth 1 -name 'oparq-*.whl' -print -quit)
+          smoke_environment="$RUNNER_TEMP/oparq-wheel-smoke"
+          uv pip install --python "$smoke_environment/bin/python" "$wheel_path[duckdb]"
+          "$smoke_environment/bin/python" -I "$GITHUB_WORKSPACE/scripts/check_distribution.py" --smoke --with-duckdb
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: distributions
+          path: dist/
+
+# Publishing deliberately remains a manual, separately authorized operation.

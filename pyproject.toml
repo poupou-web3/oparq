@@ -1,0 +1,51 @@
+[project]
+name = "oparq"
+version = "0.3.0"
+description = "Reduce Parquet and S3/GCS bucket storage with compression-friendly row ordering"
+readme = "README.md"
+authors = [
+    { name = "Poupou", email = "poupou-web3@protonmail.com" }
+]
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = [
+    "parquet", "compression", "pyarrow", "duckdb", "s3", "gcs",
+    "object-storage", "data-lake", "row-ordering",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: System :: Archiving :: Compression",
+    "Typing :: Typed",
+]
+dependencies = [
+    "pyarrow>=16",
+]
+
+[project.optional-dependencies]
+duckdb = ["duckdb>=1.5.6,<2"]
+
+[project.scripts]
+oparq = "oparq.cli:main"
+
+[dependency-groups]
+release = ["twine>=6,<7", "huggingface-hub>=2,<3"]
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "oparq"
+module-root = "src"
+source-include = []
+source-exclude = ["__pycache__", "*.pyc", "*.pyo", "/site", "/dist", "/build"]

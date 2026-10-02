@@ -1,0 +1,46 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.pytest_cache/
+.coverage
+oparq-benchmark-*/
+
+# Virtual environments
+.venv
+
+# Generated documentation and publication bundles
+/site/
+/benchmarks/hub-bundle/
+/benchmarks/published/
+/benchmarks/publication/
+/benchmarks/results/*.log
+/benchmarks/results/*.tmp
+/benchmarks/results/*.checkpoint
+.DS_Store
+
+# Local inputs, output files, and upstream research checkouts are not oparq.
+/local/
+# Credentials must never enter the public repository.
+.env
+.env.*
+!.env.example
+.aws/
+*.pem
+*.key
+/data/
+/opti/
+/arrow/
+/arrow-go/
+/arrow-rs/
+/cudf/
+/dataframe/
+/duckdb/
+/hyparquet/
+/parquet-format/
+/parquet-java/
+/parquet-testing/
+/polars/
