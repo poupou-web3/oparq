@@ -37,6 +37,8 @@ Documentation = "https://github.com/poupou-web3/oparq/tree/main/docs"
 Repository = "https://github.com/poupou-web3/oparq"
 Issues = "https://github.com/poupou-web3/oparq/issues"
 Changelog = "https://github.com/poupou-web3/oparq/blob/main/CHANGELOG.md"
+Benchmarks = "https://huggingface.co/datasets/Poupou/oparq-benchmarks"
+"Benchmark inputs" = "https://huggingface.co/datasets/Poupou/oparq-benchmark-inputs"
 
 [project.optional-dependencies]
 duckdb = ["duckdb>=1.5.6,<2"]

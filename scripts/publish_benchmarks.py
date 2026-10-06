@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Publish only an audited prepared results bundle, with explicit public consent."""
+"""Publish only an audited prepared bundle, with explicit public consent.
+
+Two bundle kinds exist: results only (no source rows), and benchmark inputs
+limited to the datasets cleared for republication in ``prepare_inputs.py``.
+"""
 
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 from pathlib import Path
 import re
@@ -13,15 +18,35 @@ import pyarrow.parquet as pq
 
 if __package__:
     from .prepare_benchmarks import CHECKSUM_FILE, RESULT_SCHEMA, sha256_file
+    from .prepare_inputs import KIND as INPUTS_KIND, PUBLISHED
 else:
     from prepare_benchmarks import CHECKSUM_FILE, RESULT_SCHEMA, sha256_file
+    from prepare_inputs import KIND as INPUTS_KIND, PUBLISHED
+
+RESULTS_KIND = "oparq_results_only"
+COMMIT_MESSAGES = {
+    RESULTS_KIND: "Publish audited oparq results-only benchmark bundle",
+    INPUTS_KIND: "Publish oparq benchmark inputs cleared for republication",
+}
 
 
 def verify_bundle(bundle: Path) -> list[str]:
     bundle = bundle.resolve()
     marker = json.loads((bundle / "bundle-manifest.json").read_text())
-    if marker.get("kind") != "oparq_results_only" or marker.get("source_rows_included") is not False:
-        raise ValueError("not an audited results-only bundle")
+    kind = marker.get("kind")
+    if kind == RESULTS_KIND and marker.get("source_rows_included") is False:
+        datasets: set[str] = set()
+        allowed_roots = {"results", "summaries", "tables", "reproduction"}
+        allowed_root_files = {"README.md", "REPRODUCE.md", "input-manifest.json", "source-provenance.json",
+                              "environment.json", "bundle-manifest.json"}
+    elif kind == INPUTS_KIND:
+        datasets = set(marker.get("datasets", ()))
+        if not datasets or datasets - set(PUBLISHED):
+            raise ValueError("inputs bundle names datasets not cleared for republication")
+        allowed_roots = {"clickhouse"}
+        allowed_root_files = {"README.md", "bundle-manifest.json"}
+    else:
+        raise ValueError("not an audited oparq publication bundle")
     manifest = json.loads((bundle / CHECKSUM_FILE).read_text())
     if manifest.get("format_version") != 1:
         raise ValueError("unsupported checksum manifest")
@@ -34,9 +59,6 @@ def verify_bundle(bundle: Path) -> list[str]:
             actual.add(path.relative_to(bundle).as_posix())
     if actual != listed | {CHECKSUM_FILE}:
         raise ValueError("bundle contains missing or unlisted files")
-    allowed_roots = {"results", "summaries", "tables", "reproduction"}
-    allowed_root_files = {"README.md", "REPRODUCE.md", "input-manifest.json", "source-provenance.json",
-                          "environment.json", "bundle-manifest.json"}
     for relative in listed:
         parts = Path(relative).parts
         if Path(relative).is_absolute() or ".." in parts:
@@ -49,7 +71,11 @@ def verify_bundle(bundle: Path) -> list[str]:
         expected = manifest["files"][relative]
         if path.stat().st_size != expected["size_bytes"] or sha256_file(path) != expected["sha256"]:
             raise ValueError(f"bundle checksum mismatch: {relative}")
-        if path.suffix == ".parquet":
+        if kind == INPUTS_KIND:
+            # Only cleared datasets' Parquet files, at clickhouse/<dataset>/<file>.
+            if len(parts) > 1 and (len(parts) != 3 or parts[1] not in datasets or path.suffix != ".parquet"):
+                raise ValueError(f"inputs bundles may only contain cleared datasets' Parquet files: {relative}")
+        elif path.suffix == ".parquet":
             if relative not in {"tables/full_corpus.parquet", "tables/saved_plan_engines.parquet"}:
                 raise ValueError("only normalized measurement Parquet tables may be uploaded")
             if not pq.read_schema(path).equals(RESULT_SCHEMA, check_metadata=False):
@@ -63,6 +89,7 @@ def publish_bundle(bundle: Path, repo_id: str, *, confirm_public: bool = False,
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", repo_id):
         raise ValueError("repo_id must explicitly name owner/dataset")
     files = verify_bundle(bundle)
+    kind = json.loads((bundle / "bundle-manifest.json").read_text())["kind"]
     if dry_run:
         return {"repo_id": repo_id, "visibility": "public", "files": len(files), "published": False}
     if not confirm_public:
@@ -73,6 +100,7 @@ def publish_bundle(bundle: Path, repo_id: str, *, confirm_public: bool = False,
         api = HfApi()  # Uses existing login/HF_TOKEN; never print credentials.
     api.whoami()  # An unauthenticated 404 does not establish repo absence.
     parent_commit = None
+    stale: list[str] = []
     # Never change an existing private repository's visibility implicitly.
     try:
         info = api.repo_info(repo_id=repo_id, repo_type="dataset")
@@ -93,14 +121,17 @@ def publish_bundle(bundle: Path, repo_id: str, *, confirm_public: bool = False,
             remote_marker = json.loads(Path(api.hf_hub_download(
                 repo_id=repo_id, filename="bundle-manifest.json", repo_type="dataset",
             )).read_text())
-            if remote_marker.get("kind") != "oparq_results_only":
+            if remote_marker.get("kind") != kind:
                 raise ValueError("refusing to overwrite an unrelated dataset repository")
+            # An update mirrors the verified bundle: files it no longer contains are removed.
+            stale = sorted(remote_files - set(files))
     commit = api.upload_folder(folder_path=str(bundle.resolve()), repo_id=repo_id,
                                repo_type="dataset", allow_patterns=files,
+                               delete_patterns=[glob.escape(path) for path in stale] or None,
                                parent_commit=parent_commit,
-                               commit_message="Publish audited oparq results-only benchmark bundle")
+                               commit_message=COMMIT_MESSAGES[kind])
     return {"repo_id": repo_id, "visibility": "public", "files": len(files), "published": True,
-            "commit_url": getattr(commit, "commit_url", str(commit))}
+            "deleted": stale, "commit_url": getattr(commit, "commit_url", str(commit))}
 
 
 def main(argv: list[str] | None = None) -> int:

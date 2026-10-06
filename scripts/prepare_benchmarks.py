@@ -14,6 +14,7 @@ from pathlib import Path
 import platform
 import shutil
 import tempfile
+import tomllib
 from typing import Any
 
 import pyarrow as pa
@@ -164,7 +165,7 @@ def _source_provenance(report: dict[str, Any]) -> dict[str, Any]:
             "https://clickhouse.com/blog/announcing-the-new-sql-playground",
             "https://github.com/ClickHouse/ClickBench",
         ],
-        "limitation": "This results-only release is not independently reproducible from public data alone. Supply matching input files and verify every full-file SHA256; exact upstream acquisition remains undocumented."}
+        "limitation": "Results only. Inputs are republished separately only where upstream terms allow it (scripts/prepare_inputs.py); supply the others yourself and verify every full-file SHA256. Exact upstream acquisition remains undocumented."}
 
 
 def _copy_snapshot(repository: Path, destination: Path) -> None:
@@ -207,8 +208,8 @@ def _generated_summary(report: dict[str, Any], name: str, *, engines: bool) -> s
         f"Reproduction runner: [{runner}](../reproduction/benchmarks/{runner}).",
         "", f"Recorded versions: `{json.dumps(report['versions'], sort_keys=True)}`.", "",
         "Historical development measurements, not a fresh test of the bundled current code. "
-        "Original inputs are not included in this results bundle; original-input publication "
-        "is a separate ClickHouse-only scope that excludes Solana.", "",
+        "Original inputs are not included in this results bundle; inputs whose upstream "
+        "terms allow it are published separately.", "",
         "Ordering scope: " + ("each physical file separately." if engines else "all rows globally within each dataset."), "",
         "Rows, codec/level, row-group size, and writer are held fixed against the no-sort baseline. "
         "Source encoder levels are not recoverable from Parquet footers. "
@@ -244,7 +245,21 @@ def _environment(reports: list[dict[str, Any]]) -> dict[str, Any]:
             "historical_snapshot_note": "The bundled snapshot is the current preparation-time source. Earlier cases were run during development and were not individually archived; recorded versions/method changes remain in the checkpoints. Timings are hardware-dependent."}
 
 
-def _dataset_card(full: dict[str, Any], manifest: dict[str, Any]) -> str:
+def _project_links(repository: Path) -> str:
+    """Link the card to its source repository, PyPI package, and republished inputs."""
+
+    with (repository / "pyproject.toml").open("rb") as stream:
+        project = tomllib.load(stream).get("project", {})
+    urls = project.get("urls", {})
+    links = [f"[source code]({urls['Repository']})"] if "Repository" in urls else []
+    if project.get("name"):
+        links.append(f"[PyPI package](https://pypi.org/project/{project['name']}/)")
+    if "Benchmark inputs" in urls:
+        links.append(f"[benchmark inputs]({urls['Benchmark inputs']})")
+    return " · ".join(links)
+
+
+def _dataset_card(full: dict[str, Any], manifest: dict[str, Any], links: str = "") -> str:
     total_rows = sum(dataset["inventory"]["rows"] for dataset in full["datasets"])
     total_files = len(manifest["files"])
     return f"""---
@@ -265,7 +280,7 @@ configs:
 ---
 # oparq benchmark results
 
-Results only: **{len(full['datasets'])} datasets, {total_rows:,} input rows,
+{links + chr(10) + chr(10) if links else ""}Results only: **{len(full['datasets'])} datasets, {total_rows:,} input rows,
 {total_files:,} source files**. No original source rows are distributed.
 The viewer rows describe algorithm measurements, not individual source events.
 
@@ -280,10 +295,10 @@ See `summaries/`, `results/` (path-sanitized checkpoints), `input-manifest.json`
 `source-provenance.json`, and `REPRODUCE.md`. Full-file SHA256 completeness:
 **{manifest['full_sha256_complete']}**. Bundle files have SHA256 checksums.
 
-Important limitations: the original export queries, upstream immutable
-revisions, and source redistribution licenses were not established.
-Original-input publication is a separate scope covering ClickHouse-derived
-datasets only; Solana is excluded. **This is not independently
+Important limitations: the original export queries and upstream immutable
+revisions were not established. Inputs whose upstream terms allow
+republication are published separately with their licences; the others
+are not. **The full corpus is not independently
 reproducible from public inputs alone**, even when all local source hashes
 are supplied. The snapshot records current code, not a separately archived
 historical executable for each development-time case. Timings are single
@@ -304,14 +319,13 @@ source data or imply source-data redistribution permission.
 
 REPRODUCE = """# Reproduction
 
-This bundle excludes original input rows. Obtain the exact original inputs
-separately and place files under `reproduction/local/data/source/`, stripping the
-`inputs/` prefix from each input-manifest path. Verify every complete-file
-SHA256 before claiming input-byte reproduction. Sizes, schemas, and row counts
-alone do not identify exact inputs. Missing upstream/export provenance and
-the unpublished inputs prevent public, independently complete reruns. Solana
-is excluded from the proposed public original-input collection; the historical
-results here still include it.
+This bundle excludes original input rows. Inputs whose terms allow it are
+published separately, byte for byte; obtain the others yourself. Place files
+under `reproduction/local/data/source/`, stripping the `inputs/` prefix from
+each input-manifest path. Verify every complete-file SHA256 before claiming
+input-byte reproduction. Sizes, schemas, and row counts alone do not identify
+exact inputs. Missing upstream/export provenance and the unpublished inputs
+prevent complete public reruns.
 
 The bundled `reproduction/` tree is an allowlisted current source snapshot:
 package code, runners, tests, publication scripts, pyproject.toml and uv.lock.
@@ -389,7 +403,7 @@ def prepare_bundle(repository: Path, destination: Path, *, data_root: Path | Non
         _write_json(staging / "input-manifest.json", manifest)
         _write_json(staging / "source-provenance.json", _source_provenance(full))
         _write_json(staging / "environment.json", _environment(reports))
-        (staging / "README.md").write_text(_dataset_card(full, manifest))
+        (staging / "README.md").write_text(_dataset_card(full, manifest, _project_links(repository)))
         (staging / "REPRODUCE.md").write_text(REPRODUCE)
         _write_json(staging / "bundle-manifest.json", {
             "format_version": 1, "kind": "oparq_results_only", "source_rows_included": False,

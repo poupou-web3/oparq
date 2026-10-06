@@ -27,19 +27,34 @@ levels were unknown, not inferred to be 1 or 9.
 
 The best mixture is an **after-the-fact selection**, not a measured outcome
 of `auto` or a sample-only chooser. No global optimum or uniform saving is
-claimed. Important dataset results include:
+claimed. Every dataset, as bytes saved against its identical no-sort output:
 
-| Dataset / strategy | Full rows | Saved against identical no-sort output |
-| --- | ---: | ---: |
-| ontime / `portfolio` | 33,000,000 | 65.94% |
-| Solana / `codec_fast` | 6,105,615 | 52.67% |
-| stock / `portfolio` | 14,910,341 | 33.54% |
-| Hits / `codec_fast` | 5,000,000 | 0.20% |
-| PyPI / both search methods | 40,000,000 | 0%; input order retained |
-| cisco_umbrella / `codec_fast` | 95,000,000 | −129.00%: larger |
-| noaa_v2 / `codec_fast` | 364,000,000 | −198.76%: larger |
+| Dataset | Full rows | `codec_fast` | `portfolio` |
+| --- | ---: | ---: | ---: |
+| cell_towers | 22,000,000 | 0%; input order kept | 0%; input order kept |
+| cisco_umbrella | 95,000,000 | −129.00%: larger | 0%; input order kept |
+| covid | 8,730,363 | 0%; input order kept | 0%; input order kept |
+| dns | 52,000,000 | 6.95% | 5.33% |
+| forex | 90,000,000 | 18.57% | 18.73% |
+| hackernews | 4,000,000 | 1.98% | 1.95% |
+| hackernews_history | 4,000,000 | 1.06% | 1.74% |
+| hackernews_top | 9,000,000 | 29.81% | 29.81% |
+| hits | 5,000,000 | 0.20% | 0%; input order kept |
+| lineorder | 19,000,000 | 0%; input order kept | 0%; input order kept |
+| noaa_v2 | 364,000,000 | −198.76%: larger | 5.04% |
+| ontime | 33,000,000 | 60.71% | 65.94% |
+| opensky | 13,000,000 | 0%; input order kept | 0%; input order kept |
+| pypi | 40,000,000 | 0%; input order kept | 0%; input order kept |
+| recipes | 2,000,000 | 0%; input order kept | 0%; input order kept |
+| Solana | 6,105,615 | 52.67% | 43.00% |
+| stock | 14,910,341 | 29.20% | 33.54% |
+| tranco | 122,000,000 | −132.52%: larger | 0%; input order kept |
+| trips | 15,000,000 | 33.29% | 32.87% |
+| uk_price_paid | 31,192,662 | 0.31% | 0%; input order kept |
+| workflow_jobs | 18,000,000 | 11.77% | 1.01% |
 
-These regressions are why sample estimates are not promised savings and
+The `codec_fast` regressions above (cisco_umbrella, noaa_v2, tranco) are why
+sample estimates are not promised savings and
 production preserved-settings file rewrites compare actual candidate bytes
 with the original. The raw runner intentionally measures bad candidates
 rather than hiding them behind that guard.
@@ -106,17 +121,26 @@ bytes, but that does not make the STRING column conforming.
 ## Input availability and reproducibility
 
 The original inputs are not included in the source repository or Python
-distributions. The intended public input corpus comprises the 20
-ClickHouse-derived datasets: 961,833,366 rows in 966 files. Solana is excluded
-from original-input publication; its historical measurements remain labeled
-above. Publishing original ClickHouse inputs requires source attribution and
-the applicable upstream redistribution terms, not oparq's MIT license.
+distributions. They were exported from the ClickHouse public playground, but
+each dataset keeps its upstream terms, not oparq's MIT license.
 
-No Hugging Face upload is confirmed. The existing results-bundle tool publishes
-measurements, hashes, provenance, and reproduction code only; it does not yet
-implement original-input upload. Exact acquisition/export provenance and
-immutable public input revisions have not been established. Until matching
-inputs are available, an independent full rerun is not publicly reproducible.
+Inputs are republished only where those terms allow it: `ontime`, `trips`,
+`lineorder`, `cell_towers`, and `covid` (97,730,363 rows in 98 files) are in the
+[`Poupou/oparq-benchmark-inputs`](https://huggingface.co/datasets/Poupou/oparq-benchmark-inputs) dataset,
+byte for byte, with each source's licence and required attribution. The other
+16 inputs (`cisco_umbrella`, `dns`, `forex`, the three `hackernews` tables,
+`hits`, `noaa_v2`, `opensky`, `pypi`, `recipes`, `stock`, `tranco`,
+`uk_price_paid`, `workflow_jobs`, and Solana) are not republished because their
+terms do not allow it or no licence could be established; the dataset card
+gives the reason for each.
+
+The results bundle is published as the
+[`Poupou/oparq-benchmarks`](https://huggingface.co/datasets/Poupou/oparq-benchmarks) dataset: the
+path-sanitized checkpoints, normalized tables, a full-file SHA-256 for each of
+the 986 inputs, provenance records, and the oparq 0.3.0 source snapshot. It
+contains no original input rows. Exact acquisition/export provenance and
+immutable public input revisions have not been established, so a full rerun
+is publicly reproducible only for the five republished datasets.
 Historical cases also lack separately archived executable snapshots; the
 current code and recorded method/version annotations must be distinguished.
 

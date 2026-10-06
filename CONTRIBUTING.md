@@ -59,8 +59,9 @@ local notes.
 Benchmark-result bundles are prepared with `scripts/prepare_benchmarks.py`
 and checked with `scripts/publish_benchmarks.py --help`. Preparation is local;
 upload requires authentication, a named target, and explicit `--confirm-public`.
-The current uploader is results-only. Original-input upload is a separate
-workflow with source/license obligations; Solana is excluded from that scope.
+Input bundles come from `scripts/prepare_inputs.py`, which copies only the
+datasets cleared in its `PUBLISHED` list, with each source's licence and
+required attribution; record a new dataset's terms there before publishing it.
 Never treat a public download URL as a blanket data license, or claim that a
 prepared bundle has already been uploaded. Generate a new bundle after code
 or docs change; do not mutate an existing checksummed snapshot.

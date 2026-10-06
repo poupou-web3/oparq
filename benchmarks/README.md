@@ -5,6 +5,7 @@ measurements. [Methodology and limitations](../docs/benchmarks.md) explains
 their coverage, correctness checks, regressions, and input availability.
 These records are not benchmarks of every subsequent package revision.
 Generate narrative summaries from JSON; do not commit dated duplicate reports.
+The published bundle is the [`Poupou/oparq-benchmarks`](https://huggingface.co/datasets/Poupou/oparq-benchmarks) dataset.
 
 For a new comparison on your own stable input files:
 
@@ -23,8 +24,9 @@ uv run --extra duckdb python -m benchmarks.compare_saved_plan \
 
 Input layout follows the inventories: `clickhouse/<dataset>/*.parquet`,
 plus an optional `solana/` tree. Runners default to ignored
-`local/data/source/`. The proposed public original-input collection excludes
-Solana; the historical measurements include it and label it explicitly.
+`local/data/source/`. Only the `ontime`, `trips`, `lineorder`, `cell_towers`,
+and `covid` inputs are republished, in [`Poupou/oparq-benchmark-inputs`](https://huggingface.co/datasets/Poupou/oparq-benchmark-inputs)
+(see `scripts/prepare_inputs.py`); the other inputs' terms do not allow it.
 
 Hold rows, codec, level, row groups, dictionaries, and writer settings fixed.
 ZSTD1 is an explicit experimental choice, not an inferred source level.

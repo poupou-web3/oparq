@@ -11,7 +11,8 @@ are not guaranteed.
 
 ## Install
 
-The library is MIT-licensed and requires Python 3.12+ and PyArrow 16+.
+The library is MIT-licensed, requires Python 3.12+ and PyArrow 16+, and is
+published on [PyPI](https://pypi.org/project/oparq/).
 
 ```bash
 pip install oparq
@@ -111,11 +112,14 @@ Solana 29.64% (33.54% and 43.00% when sorted globally). Arrow was faster in
 that run; DuckDB is retained for bounded-memory execution, not a
 demonstrated universal speed advantage.
 
-The measurements above are from historical development runs, not a claim
-that the original inputs are public. Methodology, regressions, and caveats are
-in [Benchmarks and limitations](https://github.com/poupou-web3/oparq/blob/main/docs/benchmarks.md);
+The measurements above are from historical development runs. Methodology,
+regressions, and caveats are in [Benchmarks and limitations](https://github.com/poupou-web3/oparq/blob/main/docs/benchmarks.md);
 runners and machine-readable results are in
 [`benchmarks/`](https://github.com/poupou-web3/oparq/tree/main/benchmarks).
+The complete results bundle, with a SHA-256 for every input file, is the
+[`Poupou/oparq-benchmarks`](https://huggingface.co/datasets/Poupou/oparq-benchmarks) dataset.
+Only the inputs whose terms allow republication (`ontime`, `trips`, `lineorder`,
+`cell_towers`, `covid`) are republished, in [`Poupou/oparq-benchmark-inputs`](https://huggingface.co/datasets/Poupou/oparq-benchmark-inputs).
 
 ## Documentation
 
