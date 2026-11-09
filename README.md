@@ -59,19 +59,23 @@ plan.save("events-order.json")
 
 result = oparq.rewrite_dataset(
     "s3://source-bucket/events",
-    "gs://destination-bucket/events",
+    "s3://destination-bucket/events",
     plan=oparq.RewritePlan.load("events-order.json"),
     compression_manifest=source_settings,
-    engine="duckdb",  # Install the extra; "arrow" is the default.
-    memory_limit="6GB",
+    workers=0,              # Rewrite one file per CPU at once.
+    memory_budget="48GB",   # Default: 70% of physical or container memory.
+    shard="0/4",            # Optional: this machine's quarter of the files.
 )
-print(result.rewritten_files, result.copied_files, result.skipped_files)
+print(result.rewritten_files, result.copied_files, result.resumed_files)
 ```
 
 The saved plan skips future profiling and algorithm selection. Rewrites retain
 Parquet relative paths, Hive partition directories, and file boundaries,
 sorting within each physical file. They do not coalesce partitions, copy
-arbitrary sidecars, or provide a bucket-wide transaction.
+arbitrary sidecars, or provide a bucket-wide transaction. Files are rewritten
+concurrently within a memory budget, shards split a bucket across machines
+without overlap, and a rerun resumes from per-file checkpoint markers;
+`engine="duckdb"` (optional extra) bounds memory per file by spilling.
 Prefix keys must be physical columns; virtual Hive columns are not injected.
 
 ## Defaults that protect your data
@@ -88,7 +92,7 @@ Prefix keys must be physical columns; virtual Hive columns are not injected.
   `overwrite=True`.
 - A source page index and bloom filters (PyArrow 25+) are rebuilt for the
   new row order, so rewritten files keep the same pruning structures.
-- Remote reads avoid a staging copy of source files, but data still travels
+- Remote reads never stage source files on local disk, but data still travels
   through the worker and DuckDB may spill locally. Run near your buckets.
 - Nested and detected JSON columns are not automatic sort candidates but are
   carried through sorting. Parquet already omits null-value payloads.

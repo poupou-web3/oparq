@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Rewrite dataset files concurrently: `workers=` / `--workers` runs files on a thread pool within a `memory_budget` that learns decoded bytes per row and checks live Arrow allocations. Outputs are byte-identical to serial runs.
+- Split a dataset across machines without overlap with `shard="i/N"` / `--shard`, using a stable hash of each relative path.
+- Resume interrupted rewrites from per-file checkpoint markers in `<destination>/_oparq/checkpoint` (on by default; `checkpoint=False` / `--no-checkpoint`). A marker is honored only when the source, plan keys, writer settings and output still match; leftover hidden temporaries are removed.
+- Prefetch remote source files ahead of the workers that decode them (`prefetch=`), fetching larger files as concurrent ranged reads.
+- Read Parquet footers concurrently in dataset preflight, `fit_dataset`, `inspect_compression`, directory reads and consolidation; preflight lists the destination once instead of checking each output path, and rewrites reuse footers instead of reading them again.
+- `fit_dataset` inspects 256 spread footers plus the training files by default (`footer_files=None` for all) and samples 32 files instead of 8.
+- `fit_dataset` and `sample_dataset` take windows starting at a seeded random row group (`sample_method="row_groups"`) instead of only each file's first rows; `"head"` keeps the previous behavior. Plans fitted with defaults may therefore differ from 0.3.0.
+- `fit_dataset` checks the plan on held-out files and stores per-file results in `RewritePlan.validation`; `oparq fit` prints a summary.
+- `rewrite_dataset` adds `progress`, `io_threads`, `DatasetRewriteResult.resumed_files`, `removed_temporaries`, `shard`, and `WriteResult.resumed`.
+
 ## 0.3.0 — 2026-10-02
 
 - Learn and serialize a fixed row-order plan, then apply it without repeating planning.

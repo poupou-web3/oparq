@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import posixpath
 import tempfile
 import uuid
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
@@ -16,12 +18,16 @@ import pyarrow.dataset as ds
 import pyarrow.fs as fs
 import pyarrow.parquet as pq
 
+from .execution import (
+    CHECKPOINT_DIRECTORY, TASK_OVERHEAD_BYTES, CheckpointStore, Prefetcher, Task, in_shard, parse_shard,
+    parse_size, resolve_budget, resolve_workers, run_tasks, stale_temporaries,
+)
 from .models import DatasetRewriteResult, RewritePlan, SortPlan, WriteResult
 from .sorting import unreorderable_columns
 from .storage import (
-    compression_metadata, copy_file, hidden_sibling, inspect_compression,
-    inventory_parquet, read_parquet_source, resolve_compression, resolve_location,
-    source_index_options,
+    ParquetInventory, compression_metadata, copy_file, hidden_sibling, inspect_compression,
+    inventory_parquet, read_footers, read_parquet_source, resolve_compression,
+    resolve_location, source_index_options,
 )
 
 
@@ -49,14 +55,17 @@ def _file_manifest(manifest: dict[str, Any] | None, relative_path: str) -> dict[
 
 
 def _copy_or_skip(source: str, destination: str, source_fs: fs.FileSystem,
-                  destination_fs: fs.FileSystem, plan: SortPlan, overwrite: bool) -> WriteResult:
+                  destination_fs: fs.FileSystem, plan: SortPlan, overwrite: bool,
+                  source_size: int | None = None) -> WriteResult:
     same = source_fs.equals(destination_fs) and source == destination
     started = perf_counter()
     if not same:
         copy_file(source, destination, source_filesystem=source_fs,
                   destination_filesystem=destination_fs, overwrite=overwrite)
+    if source_size is None:
+        source_size = source_fs.get_file_info(source).size
     return WriteResult(
-        path=destination, file_size=source_fs.get_file_info(source).size, plan=plan,
+        path=destination, file_size=source_size, plan=plan,
         planning_seconds=0.0, sort_seconds=0.0,
         write_seconds=0.0 if same else perf_counter() - started,
         permutation_seconds=0.0, gathering_seconds=0.0,
@@ -66,12 +75,13 @@ def _copy_or_skip(source: str, destination: str, source_fs: fs.FileSystem,
 
 def _finish_candidate(result: WriteResult, source: str, destination: str,
                       source_fs: fs.FileSystem, destination_fs: fs.FileSystem,
-                      overwrite: bool) -> WriteResult:
+                      overwrite: bool, source_size: int | None = None) -> WriteResult:
     """Publish a smaller candidate, otherwise retain the original bytes."""
 
     candidate = str(result.path)
     try:
-        source_bytes = source_fs.get_file_info(source).size
+        source_bytes = (source_fs.get_file_info(source).size
+                        if source_size is None else source_size)
         if result.file_size >= source_bytes:
             plan = replace(
                 result.plan, sort_keys=(), prefix_keys=(),
@@ -82,7 +92,7 @@ def _finish_candidate(result: WriteResult, source: str, destination: str,
             destination_fs.delete_file(candidate)
             cleanup_seconds = perf_counter() - started
             fallback = _copy_or_skip(source, destination, source_fs,
-                                     destination_fs, plan, overwrite)
+                                     destination_fs, plan, overwrite, source_bytes)
             return replace(
                 fallback, planning_seconds=result.planning_seconds,
                 sort_seconds=result.sort_seconds,
@@ -178,6 +188,12 @@ def _write_stream(schema: pa.Schema, batches: Any, destination: str,
                        write_seconds=writing)
 
 
+def _single_file(filesystem: fs.FileSystem, path: str) -> ParquetInventory:
+    """Inventory of one known file, without another existence request."""
+
+    return ParquetInventory(filesystem, path, (path,), False)
+
+
 def rewrite_file(
     source: str | Path, destination: str | Path, *,
     plan: RewritePlan | SortPlan | None = None,
@@ -189,6 +205,7 @@ def rewrite_file(
     engine: str = "arrow", row_group_size: int | None = None,
     temp_directory: str | Path | None = None,
     memory_limit: str = "6GB", max_temp_directory_size: str = "18GB",
+    footer: pq.FileMetaData | None = None, source_size: int | None = None,
     **options: Any,
 ) -> WriteResult:
     """Rewrite one file, or retain original bytes when sorting cannot help.
@@ -200,16 +217,22 @@ def rewrite_file(
     disables both guards; explicit writer changes and mandatory prefixes are
     honored even if the output grows.
     DuckDB supports natural fixed plans and may spill locally during sorting.
+    ``footer`` and ``source_size`` may pass metadata the caller already read
+    from the same, unchanged source object, saving remote requests.
     """
 
     from .io import write
 
+    observe = options.pop("_observe", None)
+    # Bytes of this exact source object, already downloaded by a prefetcher.
+    prefetched = options.pop("_source_buffer", None)
     if engine not in {"arrow", "duckdb"}:
         raise ValueError("engine must be 'arrow' or 'duckdb'")
     origin = resolve_location(source, source_filesystem)
     target = resolve_location(destination, destination_filesystem)
-    footer = pq.read_metadata(origin.path, filesystem=origin.filesystem)
-    schema = pq.read_schema(origin.path, filesystem=origin.filesystem)
+    if footer is None:
+        footer = pq.read_metadata(origin.path, filesystem=origin.filesystem)
+    schema = footer.schema.to_arrow_schema()
     empty = pa.Table.from_batches([], schema=schema)
     bound = plan.for_table(empty) if isinstance(plan, RewritePlan) else plan
     if bound is not None:
@@ -223,13 +246,15 @@ def rewrite_file(
     unchanged_settings = _preserves_writer_settings(compression, compression_level,
                                                     row_group_size, options)
     if bound is not None and not bound.sort_keys and skip_unchanged and unchanged_settings:
-        return _copy_or_skip(origin.path, target.path, origin.filesystem, target.filesystem, bound, overwrite)
+        return _copy_or_skip(origin.path, target.path, origin.filesystem, target.filesystem,
+                             bound, overwrite, source_size)
     target_info = target.filesystem.get_file_info(target.path)
     if bound is not None and target_info.type != fs.FileType.NotFound:
         if target_info.type != fs.FileType.File or not overwrite:
             raise FileExistsError(f"output already exists: {destination}")
     settings = resolve_compression(
-        inspect_compression(origin.path, origin.filesystem, manifest=compression_manifest),
+        inspect_compression(_single_file(origin.filesystem, origin.path), manifest=compression_manifest,
+                            footers={origin.path: footer}),
         compression=compression, compression_level=compression_level,
     )
     # Rebuild the source's page index and bloom filters for the new row order
@@ -239,7 +264,11 @@ def rewrite_file(
                      source_index_options([footer], output_group_rows=group_rows).items()
                      if key not in options}
     if engine == "arrow":
-        table = read_parquet_source(origin.path, origin.filesystem)
+        table = (read_parquet_source(origin.path, origin.filesystem) if prefetched is None
+                 else pq.read_table(pa.BufferReader(prefetched)))
+        del prefetched
+        if observe is not None:
+            observe(table)
         planning_seconds = 0.0
         if bound is None:
             from .planning import plan_sort
@@ -255,7 +284,7 @@ def rewrite_file(
             planning_seconds = perf_counter() - started
             if not bound.sort_keys and skip_unchanged and unchanged_settings:
                 return replace(_copy_or_skip(origin.path, target.path, origin.filesystem,
-                                              target.filesystem, bound, overwrite),
+                                              target.filesystem, bound, overwrite, source_size),
                                planning_seconds=planning_seconds)
         target_info = target.filesystem.get_file_info(target.path)
         if target_info.type != fs.FileType.NotFound:
@@ -271,7 +300,8 @@ def rewrite_file(
                            **settings.writer_options(), **index_options, **options)
             result = replace(result, planning_seconds=result.planning_seconds + planning_seconds)
             return (_finish_candidate(result, origin.path, target.path, origin.filesystem,
-                                       target.filesystem, overwrite) if guarded else result)
+                                       target.filesystem, overwrite, source_size)
+                    if guarded else result)
         finally:
             if guarded and target.filesystem.get_file_info(output).type == fs.FileType.File:
                 target.filesystem.delete_file(output)
@@ -281,8 +311,11 @@ def rewrite_file(
         raise ValueError("DuckDB currently supports natural-order learned plans; use engine='arrow' for frequency")
     from .engines import duckdb_sorted_batches
 
-    dataset = ds.dataset([origin.path], filesystem=origin.filesystem, format="parquet")
-    scanner = dataset.scanner(batch_size=262_144)
+    if prefetched is None:
+        source_batches = ds.dataset([origin.path], filesystem=origin.filesystem,
+                                    format="parquet").scanner(batch_size=262_144).to_batches()
+    else:
+        source_batches = pq.ParquetFile(pa.BufferReader(prefetched)).iter_batches(batch_size=262_144)
     writer_options = {**index_options,
                       **{key: value for key, value in options.items() if key in _WRITER_OPTIONS}}
     guarded = skip_unchanged and unchanged_settings and not bound.prefix_keys
@@ -291,7 +324,7 @@ def rewrite_file(
     try:
         with tempfile.TemporaryDirectory(prefix="oparq-spill-", dir=temp_directory) as spill:
             started = perf_counter()
-            with duckdb_sorted_batches(schema, scanner.to_batches(), bound.sort_keys,
+            with duckdb_sorted_batches(schema, source_batches, bound.sort_keys,
                                        temp_directory=spill, memory_limit=memory_limit,
                                        max_temp_directory_size=max_temp_directory_size,
                                        null_placement=bound.null_placement) as batches:
@@ -301,16 +334,74 @@ def rewrite_file(
                                        overwrite if not guarded else False, writer_options)
             result = replace(result, sort_seconds=result.sort_seconds + initial_sort)
             return (_finish_candidate(result, origin.path, target.path, origin.filesystem,
-                                       target.filesystem, overwrite) if guarded else result)
+                                       target.filesystem, overwrite, source_size)
+                    if guarded else result)
     finally:
         if guarded and target.filesystem.get_file_info(output).type == fs.FileType.File:
             target.filesystem.delete_file(output)
+
+
+def _run_fingerprint(plan: RewritePlan, options: dict[str, Any],
+                     file_manifest: dict[str, Any] | None) -> str:
+    """Everything that changes a file's output bytes, except the engine.
+
+    Arrow and DuckDB produce the same logical order with the same writer, so
+    a run may resume with the other engine without redoing finished files.
+    """
+
+    payload = {
+        "plan": {name: getattr(plan, name) for name in (
+            "sort_keys", "prefix_keys", "value_order", "null_placement", "column_types")},
+        "compression": options.get("compression", "preserve"),
+        "compression_level": options.get("compression_level", "preserve"),
+        "row_group_size": options.get("row_group_size"),
+        "skip_unchanged": options.get("skip_unchanged", True),
+        "writer": {key: options[key] for key in sorted(_WRITER_OPTIONS.intersection(options))},
+        "manifest": file_manifest,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=repr).encode()).hexdigest()
+
+
+def _source_identity(info: fs.FileInfo) -> dict[str, Any]:
+    return {"size": info.size, "mtime_ns": info.mtime_ns}
+
+
+def _resumed_result(plan: RewritePlan, output: str, marker: dict[str, Any]) -> WriteResult:
+    bound = SortPlan(
+        requested_algorithm=plan.algorithm, algorithm=plan.algorithm,
+        sort_keys=tuple(marker.get("sort_keys", ())),
+        prefix_keys=tuple(marker.get("prefix_keys", ())), profiles=(),
+        total_rows=int(marker.get("rows", 0)), sampled_rows=plan.sampled_rows,
+        value_order=plan.value_order, null_placement=plan.null_placement,
+        note=marker.get("note") or "completed by an earlier run; resumed from checkpoint",
+    )
+    return WriteResult(path=output, file_size=int(marker["output_size"]), plan=bound,
+                       planning_seconds=0.0, sort_seconds=0.0, write_seconds=0.0,
+                       permutation_seconds=0.0, gathering_seconds=0.0,
+                       action=marker["action"], resumed=True)
+
+
+def _checkpoint_store(checkpoint: Any, target: Any,
+                      destination_filesystem: fs.FileSystem | None) -> CheckpointStore | None:
+    if checkpoint is False or checkpoint is None:
+        return None
+    if checkpoint is True:
+        return CheckpointStore(target.filesystem, posixpath.join(target.path, CHECKPOINT_DIRECTORY))
+    location = resolve_location(checkpoint, destination_filesystem)
+    return CheckpointStore(location.filesystem, location.path)
 
 
 def rewrite_dataset(
     source: str | Path, destination: str | Path, *, plan: RewritePlan,
     source_filesystem: fs.FileSystem | None = None,
     destination_filesystem: fs.FileSystem | None = None,
+    workers: int = 1,
+    memory_budget: int | str | None = None,
+    shard: str | tuple[int, int] | None = None,
+    checkpoint: bool | str | Path = True,
+    progress: Callable[[WriteResult, int, int], None] | None = None,
+    io_threads: int | None = None,
+    prefetch: int | None = None,
     **options: Any,
 ) -> DatasetRewriteResult:
     """Reuse one plan per input file, retaining every relative partition path.
@@ -318,6 +409,23 @@ def rewrite_dataset(
     Sorting is global within each physical file. File boundaries and Hive
     directories are preserved; this does not coalesce an entire partition.
     Dataset-level aggregate metadata files are not copied with stale offsets.
+
+    ``workers`` rewrites that many files concurrently (``0``: one per CPU);
+    Arrow decoding, sorting and encoding release the GIL, so threads scale.
+    ``memory_budget`` (bytes or ``"24GB"``; default 70% of physical or
+    container memory) bounds the estimated decoded size of in-flight files.
+    ``shard="i/N"`` processes only files whose relative-path hash falls in
+    shard ``i`` of ``N``: machines given different ``i`` never overlap.
+    ``checkpoint`` (default ``True``: ``<destination>/_oparq/checkpoint``, or
+    a path/URI, or ``False``) writes one marker per finished file; a rerun
+    skips files whose source, plan, settings and output are unchanged.
+    ``progress(result, completed, total)`` is called after each file.
+    For remote sources with several workers, Arrow's process-wide I/O thread
+    pool is raised to ``io_threads`` (default ``4 * workers``) for the run.
+    ``prefetch`` downloads that many upcoming source files ahead of the
+    workers that decode them (default: ``max(2, workers)`` for remote sources,
+    ``0`` for local files), overlapping network transfer with CPU work. Files
+    above 16 MiB are fetched as concurrent ranged reads.
     """
 
     inventory = inventory_parquet(source, source_filesystem)
@@ -329,6 +437,13 @@ def rewrite_dataset(
         raise ValueError("engine must be 'arrow' or 'duckdb'")
     if engine == "duckdb" and plan.value_order != "natural":
         raise ValueError("DuckDB currently supports natural-order learned plans; use engine='arrow' for frequency")
+    workers = resolve_workers(workers)
+    budget = resolve_budget(memory_budget) if workers > 1 else None
+    shard = parse_shard(shard)
+    if io_threads is not None and io_threads <= 0:
+        raise ValueError("io_threads must be positive")
+    if prefetch is not None and (isinstance(prefetch, bool) or prefetch < 0):
+        raise ValueError("prefetch must be a non-negative number of files")
     if inventory.filesystem.equals(target.filesystem):
         source_root = inventory.root.rstrip("/")
         destination_root = target.path.rstrip("/")
@@ -341,16 +456,52 @@ def rewrite_dataset(
                                                 options.get("row_group_size"), options))
     manifest = options.get("compression_manifest")
     overwrite = options.get("overwrite", False)
-    prepared = []
     source_paths = set(inventory.files)
     same_filesystem = inventory.filesystem.equals(target.filesystem)
     root_info = target.filesystem.get_file_info(target.path)
     if root_info.type not in {fs.FileType.Directory, fs.FileType.NotFound}:
         raise FileExistsError(f"dataset destination is not a directory: {destination}")
+    # Ancestors of the destination root are shared by every output: check once.
+    parent = posixpath.dirname(target.path.rstrip("/"))
+    while parent:
+        info = target.filesystem.get_file_info(parent)
+        if info.type not in {fs.FileType.Directory, fs.FileType.NotFound}:
+            raise FileExistsError(f"output parent is not a directory: {parent}")
+        next_parent = posixpath.dirname(parent)
+        if next_parent == parent:
+            break
+        parent = next_parent
+    # One listing replaces per-file existence requests for outputs and parents.
+    listing = (target.filesystem.get_file_info(fs.FileSelector(target.path, recursive=True))
+               if root_info.type == fs.FileType.Directory else [])
+    existing = {info.path: info for info in listing}
+    files = [file for file in inventory.files if in_shard(inventory.relative_path(file), shard)]
+    store = _checkpoint_store(checkpoint, target, destination_filesystem)
+    markers = store.load(inventory.relative_path(file) for file in files) if store else {}
+
+    resumed: dict[str, WriteResult] = {}
+    remaining = []
+    for file in files:
+        relative = inventory.relative_path(file)
+        output = posixpath.join(target.path, relative)
+        file_manifest = _file_manifest(manifest, relative)
+        fingerprint = _run_fingerprint(plan, options, file_manifest)
+        identity = _source_identity(inventory.info(file))
+        marker = markers.get(relative)
+        output_info = existing.get(output)
+        if (marker and marker.get("fingerprint") == fingerprint and marker.get("source") == identity
+                and output_info is not None and output_info.type == fs.FileType.File
+                and output_info.size == marker.get("output_size")):
+            resumed[file] = _resumed_result(plan, output, marker)
+        else:
+            remaining.append((file, relative, output, file_manifest, fingerprint, identity))
+
     # Validate all schemas, compression provenance and destination paths before
     # publishing anything. A no-sort byte copy does not need encoder provenance.
-    for file in inventory.files:
-        schema = pq.read_schema(file, filesystem=inventory.filesystem)
+    footers = read_footers(inventory.filesystem, [item[0] for item in remaining])
+    prepared = []
+    for (file, relative, output, file_manifest, fingerprint, identity), footer in zip(remaining, footers):
+        schema = footer.schema.to_arrow_schema()
         plan.for_table(pa.Table.from_batches([], schema=schema))
         blocked = unreorderable_columns(schema) if engine == "arrow" and plan.sort_keys else []
         if blocked and plan.prefix_keys:
@@ -360,35 +511,125 @@ def rewrite_dataset(
         if engine == "duckdb" and plan.sort_keys:
             from .engines import validate_duckdb_schema
             validate_duckdb_schema(schema)
-        relative = inventory.relative_path(file)
-        output = posixpath.join(target.path, relative)
         same = same_filesystem and file == output
         if same_filesystem and output in source_paths and not same:
             raise ValueError(f"destination would overwrite another source file: {output}")
-        output_info = target.filesystem.get_file_info(output)
-        if output_info.type != fs.FileType.NotFound:
+        output_info = existing.get(output)
+        if output_info is not None:
             if output_info.type != fs.FileType.File or (not overwrite and not (same and copies_original)):
-                raise FileExistsError(f"output already exists: {output}")
+                hint = ("; it has no matching checkpoint marker, so pass overwrite=True to replace it"
+                        if store and output_info.type == fs.FileType.File else "")
+                raise FileExistsError(f"output already exists: {output}{hint}")
         parent = posixpath.dirname(output)
-        while parent:
-            info = target.filesystem.get_file_info(parent)
-            if info.type not in {fs.FileType.Directory, fs.FileType.NotFound}:
+        while parent and parent.startswith(target.path.rstrip("/") + "/"):
+            info = existing.get(parent)
+            if info is not None and info.type != fs.FileType.Directory:
                 raise FileExistsError(f"output parent is not a directory: {parent}")
-            next_parent = posixpath.dirname(parent)
-            if next_parent == parent:
-                break
-            parent = next_parent
-        file_manifest = _file_manifest(manifest, relative)
+            parent = posixpath.dirname(parent)
         if not copies_original:
             resolve_compression(
-                inspect_compression(file, inventory.filesystem, manifest=file_manifest),
+                inspect_compression(_single_file(inventory.filesystem, file),
+                                    manifest=file_manifest, footers={file: footer}),
                 compression=compression, compression_level=compression_level,
             )
-        prepared.append((file, output, file_manifest))
-    results = []
-    for file, output, file_manifest in prepared:
+        prepared.append((file, relative, output, file_manifest, fingerprint, identity,
+                         footer, copies_original))
+
+    stale = stale_temporaries(listing, [item[2] for item in prepared])
+    for path in stale:
+        target.filesystem.delete_file(path)
+
+    remote = not isinstance(inventory.filesystem, fs.LocalFileSystem)
+    depth = prefetch if prefetch is not None else (max(2, workers) if remote else 0)
+    # Download in the order files will start: inventory order when serial,
+    # largest first (the scheduler's order for decoding tasks) when parallel.
+    ordered = (prepared if workers == 1 or len(prepared) <= 1 else
+               [item for _, item in sorted(enumerate(prepared),
+                                           key=lambda pair: (-(pair[1][5]["size"] or 0), pair[0]))])
+    decode_order = [item[0] for item in ordered if not item[7]]
+    prefetcher = (Prefetcher(inventory.filesystem, decode_order, depth=depth,
+                             sizes={item[0]: item[5]["size"] for item in prepared})
+                  if depth and decode_order else None)
+
+    def run(item: tuple, observe: Callable[[pa.Table], None] | None = None) -> WriteResult:
+        file, relative, output, file_manifest, fingerprint, identity, footer, copies_original = item
         file_options = {**options, "compression_manifest": file_manifest}
-        results.append(rewrite_file(file, output, plan=plan,
-                                   source_filesystem=inventory.filesystem,
-                                   destination_filesystem=target.filesystem, **file_options))
-    return DatasetRewriteResult(str(source), str(destination), tuple(results))
+        if observe is not None:
+            file_options["_observe"] = observe
+        if prefetcher is not None and not copies_original:
+            buffer = prefetcher.take(file)
+            if buffer is not None:
+                file_options["_source_buffer"] = buffer
+        result = rewrite_file(file, output, plan=plan,
+                              source_filesystem=inventory.filesystem,
+                              destination_filesystem=target.filesystem,
+                              footer=footer, source_size=identity["size"], **file_options)
+        if store is not None:
+            recorded = identity
+            if same_filesystem and file == output and result.action == "rewritten":
+                # In place, the source is now this output: a rerun must
+                # recognize the rewritten object, not the replaced one.
+                recorded = _source_identity(target.filesystem.get_file_info(output))
+            store.record(relative, {
+                "source": recorded, "fingerprint": fingerprint, "action": result.action,
+                "output_size": result.file_size, "rows": footer.num_rows,
+                "sort_keys": list(result.plan.sort_keys),
+                "prefix_keys": list(result.plan.prefix_keys), "note": result.plan.note,
+            })
+        return result
+
+    total = len(prepared)
+    completed = 0
+    produced: dict[str, WriteResult] = {}
+
+    def finished(file: str, result: WriteResult) -> None:
+        nonlocal completed
+        completed += 1
+        produced[file] = result
+        if progress is not None:
+            progress(result, completed, total)
+
+    try:
+        _execute(prepared, run, finished, workers=workers, budget=budget, engine=engine,
+                 options=options, remote=remote, io_threads=io_threads)
+    finally:
+        if prefetcher is not None:
+            prefetcher.close()
+    results = tuple(resumed[file] if file in resumed else produced[file] for file in files)
+    return DatasetRewriteResult(str(source), str(destination), results,
+                                removed_temporaries=len(stale), shard=shard)
+
+
+def _execute(prepared: list[tuple], run: Callable, finished: Callable, *, workers: int,
+             budget: int | None, engine: str, options: dict[str, Any], remote: bool,
+             io_threads: int | None) -> None:
+    """Run prepared files serially, or on the memory-bounded thread pool."""
+
+    total = len(prepared)
+    if workers == 1 or total <= 1:
+        for item in prepared:
+            finished(item[0], run(item))
+    else:
+        tasks = []
+        duckdb_estimate = (int(parse_size(options.get("memory_limit", "6GB")) * 1.25)
+                           + TASK_OVERHEAD_BYTES)
+        for index, item in enumerate(prepared):
+            footer, copies_original = item[6], item[7]
+            kind = "copy" if copies_original else engine
+            schema = footer.schema.to_arrow_schema()
+            tasks.append(Task(
+                index=index, kind=kind, rows=footer.num_rows, size=item[5]["size"] or 0,
+                schema_key=tuple((field.name, str(field.type)) for field in schema),
+                run=(lambda observe, item=item: run(item, observe)),
+                fixed_estimate=duckdb_estimate if kind == "duckdb" else None,
+            ))
+        previous_io = pa.io_thread_count()
+        wanted_io = io_threads or (4 * workers if remote else None)
+        if wanted_io and wanted_io > previous_io:
+            pa.set_io_thread_count(wanted_io)
+        try:
+            run_tasks(tasks, workers=workers, budget=budget,
+                      on_done=lambda task, result: finished(prepared[task.index][0], result))
+        finally:
+            if pa.io_thread_count() != previous_io:
+                pa.set_io_thread_count(previous_io)

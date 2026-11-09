@@ -1,10 +1,10 @@
 # S3 and GCS bucket rewrites
 
-`oparq` reads and writes cloud URIs through Arrow filesystems without first
-staging copies of the source Parquet files. It does not eliminate network
-transfer: source bytes still enter the worker, rows are decoded and sorted,
-and encoded output is sent to the destination. DuckDB can also spill
-temporary sort data locally.
+`oparq` reads and writes cloud URIs through Arrow filesystems without
+staging source Parquet files on local disk. It does not eliminate network
+transfer: source bytes still enter the worker (prefetching holds a few
+compressed files in memory), rows are decoded and sorted, and encoded output
+is sent to the destination. DuckDB can also spill temporary sort data locally.
 
 For a bucket-wide migration, run the worker near the buckets rather than
 routing the dataset through a laptop. Installing an embedded engine does
@@ -28,17 +28,24 @@ plan = oparq.fit_dataset(
     "s3://source-bucket/events",
     algorithms=("codec_fast", "portfolio", "weighted"),
     sample_rows=250_000,
-    sample_files=8,
+    sample_files=32,
     compression_manifest=source_settings,
 )
 plan.save("events-order.json")
+for check in plan.validation:
+    print(check["path"], f"{check['savings']:+.1%}")
 ```
 
-The sample is deterministic leading-row quotas from files spread across
-the inventory, not a random sample of every row. Source footer inspection
-still covers the inventory. If this is not representative, construct your
-own sample table and call `fit`. `fit` compares row-order algorithms while
-holding codec and writer settings fixed; it does not auto-select a codec.
+The sample is consecutive-row windows from 32 files spread evenly across the
+sorted inventory. Each window starts at a seeded random row group, not only
+at a file's first row, and reads only the window's pages. Codec provenance
+is checked on 256 spread footers plus the training files, read concurrently
+(`footer_files=None` inspects all). Afterwards, held-out files that were not
+used for training are written in input order and in plan order; a plan
+whose held-out savings are much lower than expected, or negative, did not
+generalize. If the sample is still not representative, construct your own
+table and call `fit`. `fit` compares row-order algorithms while holding codec
+and writer settings fixed; it does not auto-select a codec.
 
 Add `prefix=("event_date", "tenant_id")` when those natural ascending keys
 must lead the order. The planner discovers only the suffix. That requirement
@@ -65,6 +72,77 @@ Use the optional DuckDB extra for this example. The default `engine="arrow"`
 loads and sorts each physical file in memory. DuckDB consumes Arrow batches,
 supports natural fixed-key plans, and may spill when sorting. It is not
 universally faster; provision enough worker memory, spill space, and network.
+
+## Use every core of the worker
+
+Decoding, sorting and Parquet encoding each use about one core per file, so a
+single-file-at-a-time rewrite leaves most of a large VM idle. `workers`
+rewrites several files at once on threads (Arrow releases the GIL):
+
+```python
+result = oparq.rewrite_dataset(
+    "s3://source-bucket/events", "s3://destination-bucket/events",
+    plan=oparq.RewritePlan.load("events-order.json"),
+    compression_manifest=source_settings,
+    workers=0,              # one per CPU
+    memory_budget="48GB",   # default: 70% of physical or container memory
+)
+```
+
+The memory budget bounds the estimated decoded size of files in flight. A
+Parquet footer cannot predict that size (dictionary strings can decode to
+many times their page size), so the first file of each schema runs alone and
+its decoded bytes per row become the estimate; the live Arrow allocation is
+also checked before each new file starts. A single file estimated above the
+whole budget runs alone with a warning; consider `engine="duckdb"` for it.
+
+For remote sources, upcoming files are downloaded while other files are
+being decoded (`prefetch`, default `max(2, workers)` files), and Arrow's I/O
+thread pool is raised for the run. Output bytes do not depend on `workers`,
+`prefetch` or `shard`.
+
+## Split a bucket across machines
+
+`shard="i/N"` (CLI `--shard i/N`) selects files by a stable hash of their
+relative path. Shards are disjoint and cover every file, so N machines given
+`0/N` … `N-1/N` never process the same file and need no coordinator:
+
+```bash
+# On machine i of N, close to both buckets:
+oparq rewrite s3://source-bucket/events s3://destination-bucket/events \
+  --plan events-order.json --compression-manifest source-settings.json \
+  --workers 0 --shard "$INDEX/$COUNT" --progress
+```
+
+Keep the plan, manifest and options identical on every machine. A batch job
+array that passes its index works the same way.
+
+## Resume after an interruption
+
+Each finished file writes a small marker under
+`<destination>/_oparq/checkpoint/` (readers skip `_` paths). Rerun the same
+command after a crash or a failed file: files whose source size and
+modification time, plan keys, writer settings and output size all still
+match are reported as resumed without being read again, and hidden
+temporaries the interrupted run left beside its outputs are removed. The
+retry unit is one file, and every shard can resume independently.
+
+A file whose source or plan changed is processed again; if its old output
+exists, pass `overwrite=True` (`--overwrite`), which then replaces only
+outputs not covered by a matching marker. A file published just before a
+crash, but before its marker, needs the same flag. Use `checkpoint=False`
+(`--no-checkpoint`) to write no markers, or `checkpoint="s3://state/run-1"`
+to keep them elsewhere. Markers prove what this tool wrote; they are not a
+bucket-wide transaction, so keep the source snapshot frozen until all shards
+finish.
+
+## Where to run it
+
+Run workers in the same region as the buckets (a VM, or a batch job array):
+every byte is downloaded, decoded, sorted, re-encoded and uploaded. Size a
+machine by cores for throughput and by memory for concurrency: roughly
+three times the largest file's decoded size per concurrent file. Cross-cloud
+or cross-region rewrites pay egress on the full source size.
 
 ## What partition preservation means
 

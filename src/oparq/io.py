@@ -23,6 +23,9 @@ from .profile import DEFAULT_SAMPLE_ROWS, as_table
 from .sorting import ChunkedTableGather, take_table, unreorderable_columns, use_chunked_gather
 
 _UNSET = object()
+_DATASET_ONLY_OPTIONS = frozenset({
+    "workers", "memory_budget", "shard", "checkpoint", "progress", "io_threads",
+})
 
 
 def read_parquet(source: str | Path, *, filesystem: fs.FileSystem | None = None) -> pa.Table:
@@ -277,16 +280,22 @@ def rewrite(
 
     from .dataset import rewrite_file, rewrite_dataset
     from .storage import (
-        inspect_compression, inventory_parquet, resolve_compression, source_index_options,
+        inspect_compression, inventory_parquet, read_footers, resolve_compression,
+        source_index_options,
     )
 
     source_filesystem = options.pop("source_filesystem", options.pop("filesystem", None))
     destination_filesystem = options.pop("destination_filesystem", None)
     inventory = inventory_parquet(source, source_filesystem)
+    tree = inventory.is_directory and not str(destination).lower().endswith(".parquet")
+    dataset_only = sorted(_DATASET_ONLY_OPTIONS.intersection(options))
+    if dataset_only and not tree:
+        raise ValueError(f"{', '.join(dataset_only)} apply only to partition-preserving "
+                         "tree rewrites (a source directory and a destination directory)")
     if not inventory.is_directory:
         return rewrite_file(source, _output_file(destination), source_filesystem=source_filesystem,
                             destination_filesystem=destination_filesystem, **options)
-    if not str(destination).lower().endswith(".parquet"):
+    if tree:
         if not isinstance(options.get("plan"), RewritePlan):
             raise ValueError("a partition-preserving rewrite requires a reusable plan; call fit_dataset first")
         return rewrite_dataset(source, destination, source_filesystem=source_filesystem,
@@ -308,14 +317,17 @@ def rewrite(
     compression = options.pop("compression", "preserve")
     level = options.pop("compression_level", "preserve")
     manifest = options.pop("compression_manifest", None)
-    settings = resolve_compression(inspect_compression(inventory, manifest=manifest),
-                                   compression=compression, compression_level=level)
+    footers = read_footers(inventory.filesystem, inventory.files)
+    settings = resolve_compression(
+        inspect_compression(inventory, manifest=manifest,
+                            footers=dict(zip(inventory.files, footers))),
+        compression=compression, compression_level=level,
+    )
     options.pop("skip_unchanged", None)
     if options.pop("engine", "arrow") != "arrow":
         raise ValueError("use rewrite_dataset with a learned plan for DuckDB partition rewrites")
     for name in ("memory_limit", "max_temp_directory_size", "temp_directory"):
         options.pop(name, None)
-    footers = [pq.read_metadata(path, filesystem=inventory.filesystem) for path in inventory.files]
     group_rows = min(options.get("row_group_size") or 1_048_576,
                      max(1, sum(footer.num_rows for footer in footers)))
     index_options = {key: value for key, value in

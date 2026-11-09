@@ -11,8 +11,9 @@ import inspect
 import json
 import math
 import posixpath
-from collections.abc import Iterable
-from dataclasses import dataclass
+from collections.abc import Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import unquote, urlsplit
@@ -24,6 +25,9 @@ import pyarrow.parquet as pq
 
 
 COMPRESSION_METADATA_KEY = b"oparq.compression"
+# Footer reads are small ranged GETs dominated by request latency, so they
+# overlap well far beyond the CPU count.
+DEFAULT_METADATA_THREADS = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +46,12 @@ class ParquetInventory:
     root: str
     files: tuple[str, ...]
     is_directory: bool
+    # Listing metadata (size, mtime) per file, so callers need no extra HEADs.
+    infos: Mapping[str, fs.FileInfo] = field(default_factory=dict, compare=False, repr=False)
+
+    def info(self, path: str) -> fs.FileInfo:
+        found = self.infos.get(path)
+        return found if found is not None else self.filesystem.get_file_info(path)
 
     def relative_path(self, path: str) -> str:
         base = self.root if self.is_directory else posixpath.dirname(self.root)
@@ -158,23 +168,50 @@ def inventory_parquet(
     location = resolve_location(source, filesystem)
     info = location.filesystem.get_file_info(location.path)
     if info.type == fs.FileType.File:
-        files = (info.path,)
+        infos = {info.path: info}
         is_directory = False
     elif info.type == fs.FileType.Directory:
         selected = location.filesystem.get_file_info(
             fs.FileSelector(location.path, recursive=True)
         )
-        files = tuple(sorted(
-            item.path for item in selected
+        infos = {
+            item.path: item for item in selected
             if item.type == fs.FileType.File and item.path.lower().endswith(".parquet")
             and not _is_hidden(posixpath.relpath(item.path, location.path or "."))
-        ))
+        }
         is_directory = True
     else:
         raise FileNotFoundError(f"source not found: {source}")
-    if not files:
+    if not infos:
         raise FileNotFoundError(f"no Parquet files found under {source}")
-    return ParquetInventory(location.filesystem, location.path, files, is_directory)
+    return ParquetInventory(location.filesystem, location.path, tuple(sorted(infos)),
+                            is_directory, infos)
+
+
+def read_footers(
+    filesystem: fs.FileSystem, paths: Sequence[str], *, threads: int | None = None,
+) -> list[pq.FileMetaData]:
+    """Read Parquet footers concurrently, returned in the order of ``paths``.
+
+    Each footer is a small ranged read bounded by request latency, not
+    bandwidth, so remote inventories benefit from many concurrent requests.
+    The first failure (in input order) is raised after all reads finish.
+    """
+
+    paths = list(paths)
+    workers = min(threads or DEFAULT_METADATA_THREADS, len(paths))
+    if workers <= 1:
+        return [pq.read_metadata(path, filesystem=filesystem) for path in paths]
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="oparq-footer") as executor:
+        futures = [executor.submit(pq.read_metadata, path, filesystem=filesystem) for path in paths]
+    return [future.result() for future in futures]
+
+
+def spread_indices(total: int, count: int) -> list[int]:
+    """Deterministic indices spread evenly across ``range(total)``."""
+
+    count = min(count, total)
+    return [((2 * index + 1) * total) // (2 * count) for index in range(count)]
 
 
 def read_parquet_source(
@@ -195,11 +232,10 @@ def read_parquet_source(
     )
     files = list(inventory.files)
     if len(files) > 1:
-        schema = pq.read_schema(files[0], filesystem=inventory.filesystem)
-        for path in files[1:]:
-            if not pq.read_schema(path, filesystem=inventory.filesystem).equals(
-                schema, check_metadata=False
-            ):
+        schemas = [footer.schema.to_arrow_schema()
+                   for footer in read_footers(inventory.filesystem, files)]
+        for path, other in zip(files[1:], schemas[1:]):
+            if not other.equals(schemas[0], check_metadata=False):
                 raise ValueError(
                     f"Parquet files have different physical schemas: {files[0]} and "
                     f"{path}; read or rewrite each schema separately"
@@ -311,21 +347,35 @@ def inspect_compression(
     source: str | Path | ParquetInventory,
     filesystem: fs.FileSystem | None = None,
     *, manifest: Mapping[str, Any] | None = None,
+    footers: Mapping[str, pq.FileMetaData] | None = None,
+    max_files: int | None = None,
 ) -> SourceCompression:
     """Read footer codecs and optional explicit encoder-level provenance.
 
     ``manifest`` may have ``compression`` / ``compression_level`` settings and
     a ``files`` mapping of relative filenames to overrides. A manifest level
     is trusted only if its declared codec matches the actual footer codec.
+    ``footers`` supplies already-read metadata by path. ``max_files`` inspects
+    only that many files spread evenly across the inventory: the result then
+    describes that sample, not every file. Missing footers are read concurrently.
     """
 
     inventory = source if isinstance(source, ParquetInventory) else inventory_parquet(
         source, filesystem
     )
+    if max_files is not None and max_files <= 0:
+        raise ValueError("max_files must be positive")
+    paths = list(inventory.files)
+    if max_files is not None and max_files < len(paths):
+        paths = [paths[index] for index in spread_indices(len(paths), max_files)]
+    footer_by_path = dict(footers or {})
+    missing = [path for path in paths if path not in footer_by_path]
+    if missing:
+        footer_by_path.update(zip(missing, read_footers(inventory.filesystem, missing)))
     codecs: dict[str, set[str]] = {}
     observed_levels: dict[str, list[tuple[bool, int | None, str]]] = {}
-    for path in inventory.files:
-        footer = pq.read_metadata(path, filesystem=inventory.filesystem)
+    for path in paths:
+        footer = footer_by_path[path]
         relative = inventory.relative_path(path)
         payload = _provenance_payload(footer.metadata)
         origin = "oparq metadata"
