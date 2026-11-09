@@ -180,6 +180,13 @@ def _comparison_settings(
     raise error
 
 
+def _print_progress(result: object, completed: int, total: int) -> None:
+    import sys
+
+    print(f"[{completed}/{total}] {result.action} {_bytes(result.file_size)} {result.path}",
+          file=sys.stderr, flush=True)
+
+
 def _describe(settings: dict[str, object]) -> str:
     import pyarrow as pa
 
@@ -209,7 +216,17 @@ def build_parser() -> argparse.ArgumentParser:
     learn.add_argument("source")
     learn.add_argument("destination")
     learn.add_argument("--algorithms", type=_columns, default=["codec_fast", "portfolio"])
-    learn.add_argument("--sample-files", type=int, default=8)
+    learn.add_argument("--sample-files", type=int, default=32,
+                       help="training files spread across the inventory (default: 32)")
+    learn.add_argument("--sample-method", choices=("row_groups", "head"), default="row_groups",
+                       help="window start: a seeded random row group (default) or each file's first row")
+    learn.add_argument("--seed", type=int, default=0, help="sampling seed (default: 0)")
+    learn.add_argument("--footer-files", type=_nonnegative_int, default=256,
+                       help="footers inspected for codec provenance; 0 inspects every file (default: 256)")
+    learn.add_argument("--validation-files", type=_nonnegative_int, default=4,
+                       help="held-out files checked after fitting; 0 disables (default: 4)")
+    learn.add_argument("--validation-rows", type=int, default=100_000,
+                       help="rows per held-out window (default: 100000)")
     learn.add_argument("--overwrite", action="store_true")
     _common(learn, select_algorithm=False)
     _compression_options(learn)
@@ -227,6 +244,22 @@ def build_parser() -> argparse.ArgumentParser:
     rewrite_parser.add_argument("--temp-directory")
     rewrite_parser.add_argument("--row-group-size", type=int)
     rewrite_parser.add_argument("--overwrite", action="store_true")
+    tree = rewrite_parser.add_argument_group(
+        "tree rewrites", "parallelism, sharding and resume for directory-to-directory rewrites")
+    tree.add_argument("--workers", type=_nonnegative_int, default=1,
+                      help="files rewritten concurrently: 0 one per CPU (default: 1)")
+    tree.add_argument("--memory-budget",
+                      help="bound on estimated in-flight decoded bytes, e.g. 24GB "
+                           "(default: 70%% of physical or container memory)")
+    tree.add_argument("--shard", metavar="INDEX/COUNT",
+                      help="process only shard INDEX of COUNT, split by path hash")
+    resume = tree.add_mutually_exclusive_group()
+    resume.add_argument("--checkpoint", metavar="PATH",
+                        help="checkpoint location (default: DESTINATION/_oparq/checkpoint)")
+    resume.add_argument("--no-checkpoint", action="store_true",
+                        help="do not record or resume finished files")
+    tree.add_argument("--progress", action="store_true",
+                      help="print one line per finished file to stderr")
     rewrite_parser.add_argument(
         "--in-memory-sort", action="store_true",
         help="materialize the full reordered table instead of gathering row groups",
@@ -312,13 +345,22 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
             parser.error("fit requires a bounded positive --sample-rows")
         result = fit_dataset(
             args.source, algorithms=args.algorithms, sample_rows=rows,
-            sample_files=args.sample_files, compression=args.compression,
+            sample_files=args.sample_files, sample_method=args.sample_method, seed=args.seed,
+            footer_files=args.footer_files or None, validation_files=args.validation_files,
+            validation_rows=args.validation_rows, compression=args.compression,
             compression_level=args.compression_level, compression_manifest=manifest,
             **options,
         )
         result.save(args.destination, overwrite=args.overwrite)
         print(f"saved: {args.destination}")
         print(f"sort keys: {', '.join(result.sort_keys) or 'keep input order'}")
+        if result.validation:
+            savings = [item["savings"] for item in result.validation]
+            print(f"held-out windows: {len(savings)} files, savings vs input order "
+                  f"min {min(savings):+.1%} / mean {sum(savings) / len(savings):+.1%} "
+                  f"/ max {max(savings):+.1%}")
+        elif args.validation_files:
+            print("held-out windows: none (every file was used for training)")
         return
 
     if args.command == "plan":
@@ -351,6 +393,20 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
             options["gather_threads"] = args.gather_threads
         if args.in_memory_sort:
             options["stream_sort"] = False
+        # Tree-only controls are passed only when set, so a single-file
+        # rewrite with defaults is unaffected and a misuse is reported.
+        if args.workers != 1:
+            options["workers"] = args.workers
+        if args.memory_budget:
+            options["memory_budget"] = args.memory_budget
+        if args.shard:
+            options["shard"] = args.shard
+        if args.no_checkpoint:
+            options["checkpoint"] = False
+        elif args.checkpoint:
+            options["checkpoint"] = args.checkpoint
+        if args.progress:
+            options["progress"] = _print_progress
         result = rewrite(
             args.source,
             args.destination,
@@ -364,8 +420,13 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
             overwrite=args.overwrite,
         )
         if isinstance(result, DatasetRewriteResult):
-            print(f"files: {len(result.files)}; rewritten={result.rewritten_files} "
-                  f"copied={result.copied_files} skipped={result.skipped_files}")
+            shard = f" (shard {result.shard[0]}/{result.shard[1]})" if result.shard else ""
+            print(f"files: {len(result.files)}{shard}; rewritten={result.rewritten_files} "
+                  f"copied={result.copied_files} skipped={result.skipped_files} "
+                  f"resumed={result.resumed_files}")
+            if result.removed_temporaries:
+                print(f"removed {result.removed_temporaries} temporary object(s) "
+                      "left by an interrupted run")
             print(f"output: {result.destination}")
             return
         print(result.plan.explain())

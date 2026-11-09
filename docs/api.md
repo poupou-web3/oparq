@@ -57,18 +57,40 @@ settings are held fixed. This is not an automatic codec search.
 
 ## `fit_dataset(source, **options) -> RewritePlan`
 
-Read footer codec/provenance information, select deterministic files spread
-across the source, read bounded leading-row quotas, and call `fit`.
+Read footer codec/provenance information from a spread sample of files,
+take consecutive-row windows from deterministic files spread across the
+source, call `fit`, then check the plan on held-out files.
 
-Defaults: `sample_rows=250_000`, `sample_files=8`,
-`compression="preserve"`, `compression_level="preserve"`.
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `sample_rows` | `250_000` | Total training rows, split evenly across training files |
+| `sample_files` | `32` | Training files spread evenly across the sorted inventory |
+| `sample_method` | `"row_groups"` | Window start: a seeded random row group per file (weighted by rows), or `"head"` (each file's first row, the 0.3.0 behavior) |
+| `seed` | `0` | Sampling seed; equal inputs and seed give the same sample |
+| `footer_files` | `256` | Footers inspected for codec provenance, plus every training file; `None` inspects all |
+| `validation_files` | `4` | Held-out files (never trained on) checked after fitting; `0` disables |
+| `validation_rows` | `100_000` | Rows per held-out window |
+| `compression` / `compression_level` | `"preserve"` / `"preserve"` | Codec used to compare orders |
+
 Accepts `filesystem`, `compression_manifest`, `algorithms`, `prefix`, and
 other fitting options. Unknown source levels on a level-sensitive codec
-require explicit settings or trusted provenance.
+require explicit settings or trusted provenance. Footers are read
+concurrently. Sampling footers only decides the codec used to compare orders
+here; every rewrite still checks each file it re-encodes.
+
+Windows are consecutive rows, so they keep each file's existing clustering;
+only the window's pages are read, not whole files. Held-out results are stored
+in `RewritePlan.validation` as `path`, `rows`, `baseline_bytes`, `plan_bytes`
+and `savings` per file. They compare the plan with input order on windows
+written with the plan's codec. Windows are smaller than files, so savings
+usually differ from whole-file savings: use them to spot plans that do not
+generalize, not as a forecast. When the inventory has no more files than
+`sample_files`, nothing is held out and `validation` is empty.
 
 `sample_dataset(source, filesystem=None, sample_rows=250_000,
-sample_files=8) -> Table` exposes the same file-spread sampling separately.
-It samples rows, not all footer metadata; file inspection can still be broad.
+sample_files=32, sample_method="row_groups", seed=0) -> Table` exposes the
+same sampling separately. `validate_plan(windows, plan, row_group_size=None)`
+runs the held-out comparison on `(name, table)` pairs you provide.
 
 ## `RewritePlan`
 
@@ -84,6 +106,8 @@ strings.
 - `plan.as_dict()` returns JSON-compatible values.
 - `plan.for_table(table)` validates learned columns/types/nullability and
   binds a `SortPlan` to the table's row count.
+- `plan.validation` holds the held-out check written by `fit_dataset`;
+  plans saved before it existed load with an empty tuple.
 
 `fit` resolves a requested codec-default level into the effective concrete
 level before saving the plan, so fitted defaults are frozen. A manually
@@ -133,7 +157,39 @@ Requires a `RewritePlan`. Preflight schemas, source-level provenance when
 needed, and target collisions before publishing files; then rewrite each
 physical file using fixed keys. Relative paths and file boundaries are
 retained. The operation is not globally sorted across files or atomic across
-the dataset. Options are the file rewrite controls above.
+the dataset. It accepts the file rewrite controls above, plus:
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `workers` | `1` | Files rewritten concurrently on threads; `0` is one per CPU |
+| `memory_budget` | 70% of physical or container memory | Bytes or `"24GB"`; bounds estimated in-flight decoded memory when `workers > 1` |
+| `shard` | `None` | `"i/N"` or `(i, N)`: only files whose relative-path hash falls in shard `i` |
+| `checkpoint` | `True` | Markers in `<destination>/_oparq/checkpoint`; a path/URI elsewhere; `False` disables |
+| `progress` | `None` | `progress(result, completed, total)` after each processed file |
+| `prefetch` | `max(2, workers)` remote, `0` local | Source files downloaded ahead of the workers that decode them |
+| `io_threads` | `4 * workers` for remote sources | Arrow's process-wide I/O pool size during the run; restored afterwards |
+
+Preflight reads footers concurrently and lists the destination once instead
+of checking each output path. Threads scale because Arrow decoding, sorting
+and Parquet encoding release the GIL; one thread pool also lets one memory
+budget see every in-flight file. Decoded size is learned per schema from the
+first file (which runs alone) and the pool's live allocation is also checked;
+a file estimated above the whole budget runs alone with a `RuntimeWarning`.
+DuckDB files reserve 1.25 × `memory_limit` each.
+
+Shards are disjoint and cover every file; machines need no coordination.
+A checkpoint marker records the source size and modification time, a
+fingerprint of the plan keys and writer settings, and the output size. A
+rerun skips a file only when all of these still match and the output exists;
+it reads no footer for such files. A changed source or plan, or a missing
+output, is processed again (an existing stale output needs `overwrite=True`).
+Hidden temporaries left beside this run's outputs by an interrupted run are
+deleted. On a failure, no new file starts, running files finish (and are
+checkpointed), and the first error is raised.
+
+Prefetched files are fetched whole, larger ones as concurrent 16 MiB ranges,
+and decoded from memory; their buffers count toward the live allocation the
+scheduler checks. A failed prefetch falls back to a direct read.
 
 ## Planning and in-memory helpers
 
@@ -172,8 +228,11 @@ not a cloud bucket transaction. Guarded candidates retain attempted-stage
 costs even when their output is discarded. Reused plans report zero search
 time, not zero validation or sorting work.
 
-`DatasetRewriteResult.files` contains each file result; convenience counts
-are `rewritten_files`, `copied_files`, and `skipped_files`.
+`DatasetRewriteResult.files` contains each file result in inventory order;
+convenience counts are `rewritten_files`, `copied_files`, `skipped_files`,
+and `resumed_files`. A resumed `WriteResult` has `resumed=True`, the action
+recorded by the earlier run, and zero timings. `removed_temporaries` counts
+deleted leftovers of an interrupted run, and `shard` echoes the selection.
 `planning_and_sort_seconds` remains a result convenience property.
 
 `BenchmarkResult` uses `size_bytes`, `savings_fraction`, `algorithm`,

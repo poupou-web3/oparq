@@ -173,6 +173,8 @@ class RewritePlan:
     evaluations: tuple[dict[str, Any], ...] = ()
     format_version: int = 1
     schema_base64: str | None = None
+    # Held-out check written by fit_dataset: per-file input-order vs plan bytes.
+    validation: tuple[dict[str, Any], ...] = ()
 
     def _recorded_schema(self) -> pa.Schema | None:
         if self.schema_base64 is None:
@@ -261,6 +263,7 @@ class RewritePlan:
             sampled_rows=payload.get("sampled_rows", 0),
             evaluations=tuple(payload.get("evaluations", ())),
             schema_base64=payload.get("schema_base64"),
+            validation=tuple(payload.get("validation", ())),
         )
         result._recorded_schema()
         return result
@@ -306,6 +309,9 @@ class WriteResult:
     permutation_seconds: float | None = None
     gathering_seconds: float | None = None
     action: str = "rewritten"
+    # True when an earlier run completed this file and a checkpoint proved it;
+    # ``action`` then reports what that run did, and timings are zero.
+    resumed: bool = False
 
     @property
     def planning_and_sort_seconds(self) -> float:
@@ -317,6 +323,13 @@ class DatasetRewriteResult:
     source: str
     destination: str
     files: tuple[WriteResult, ...]
+    # Hidden temporaries of an interrupted earlier run that were deleted.
+    removed_temporaries: int = 0
+    shard: tuple[int, int] | None = None
+
+    @property
+    def resumed_files(self) -> int:
+        return sum(item.resumed for item in self.files)
 
     @property
     def rewritten_files(self) -> int:

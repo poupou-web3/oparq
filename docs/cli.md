@@ -23,7 +23,7 @@ the source table into memory; use `fit` for bounded training rows.
 ```bash
 oparq fit input/tree order.json \
   --algorithms codec_fast,portfolio,weighted \
-  --sample-rows 250000 --sample-files 8 \
+  --sample-rows 250000 --sample-files 32 \
   --prefix event_date \
   --compression-manifest source-settings.json
 ```
@@ -31,6 +31,18 @@ oparq fit input/tree order.json \
 `fit` always includes the input/prefix baseline and saves a reusable artifact.
 Its bounded `--sample-rows` must be positive. `--overwrite` permits replacing
 the plan artifact. Algorithm names are canonical, without aliases.
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `--sample-files N` | `32` | Training files spread across the inventory |
+| `--sample-method row_groups\|head` | `row_groups` | Window start: a seeded random row group, or each file's first row |
+| `--seed N` | `0` | Sampling seed |
+| `--footer-files N` | `256` | Footers inspected for codec provenance; `0` inspects every file |
+| `--validation-files N` | `4` | Held-out files checked after fitting; `0` disables |
+| `--validation-rows N` | `100000` | Rows per held-out window |
+
+`fit` prints the min/mean/max held-out savings against input order; they are
+stored in the plan as `validation`. See [cloud storage](cloud-storage.md).
 
 ## Rewrite a file or a partitioned tree
 
@@ -47,6 +59,21 @@ A tree destination requires a saved plan. DuckDB also requires fixed keys
 and the optional extra. The default Arrow engine can select keys for one
 file. `--force-rewrite` disables copy/skip and non-growth guards;
 `--overwrite` permits replacing destination files.
+
+Tree rewrites (a directory to a directory) also accept:
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `--workers N` | `1` | Files rewritten concurrently; `0` is one per CPU |
+| `--memory-budget SIZE` | 70% of memory | Bound on estimated in-flight decoded bytes, e.g. `48GB` |
+| `--shard INDEX/COUNT` | all files | Disjoint path-hash split for several machines |
+| `--checkpoint PATH` | `DESTINATION/_oparq/checkpoint` | Where per-file resume markers go |
+| `--no-checkpoint` | off | Write no markers and resume nothing |
+| `--progress` | off | One line per finished file on stderr |
+
+Rerunning the same command resumes: files with a matching marker are counted
+as `resumed=` and not read again. These options are rejected for single-file
+and consolidating rewrites.
 
 Writer changes include `--compression CODEC`,
 `--compression-level INTEGER|default|preserve`, and `--row-group-size ROWS`.
