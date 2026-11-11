@@ -24,7 +24,8 @@ from .sorting import ChunkedTableGather, take_table, unreorderable_columns, use_
 
 _UNSET = object()
 _DATASET_ONLY_OPTIONS = frozenset({
-    "workers", "memory_budget", "shard", "checkpoint", "progress", "io_threads",
+    "workers", "memory_budget", "shard", "checkpoint", "progress", "io_threads", "prefetch",
+    "scope", "target_file_size", "max_file_size",
 })
 
 

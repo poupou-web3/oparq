@@ -73,6 +73,65 @@ loads and sorts each physical file in memory. DuckDB consumes Arrow batches,
 supports natural fixed-key plans, and may spill when sorting. It is not
 universally faster; provision enough worker memory, spill space, and network.
 
+## Compact each partition into fewer, sorted files
+
+`rewrite_dataset` normally sorts within each file, keeping file boundaries.
+Sorting across files groups similar rows from the whole partition, which
+compresses further, and it replaces many small files with a few large ones.
+`scope="partition"` sorts all files of each leaf directory together and
+writes them as `part-00000.parquet`, `part-00001.parquet`, ... of about
+`target_file_size` (default 512 MiB):
+
+```python
+result = oparq.rewrite_dataset(
+    "s3://source-bucket/events", "s3://compacted-bucket/events",
+    plan=oparq.RewritePlan.load("events-order.json"),
+    compression_manifest=source_settings,
+    scope="partition", target_file_size="512MB", workers=0,
+)
+for partition in result.partitions:
+    print(partition.partition, len(partition.sources), "->", len(partition.outputs))
+```
+
+- **A new tree.** Replacing a set of files cannot be atomic on an object
+  store, so the destination must not be, or contain, the source tree. Write
+  to a new prefix, check it, then point readers at it.
+- **Hive directories are kept.** Each leaf directory is one partition, and
+  its files are merged only with each other. Every file in a partition must
+  share one physical schema and one codec/level.
+- **Order.** Ties keep file order, then row order. Each output file holds a
+  consecutive range of the partition's order and advertises its sort keys.
+- **Sizes: a target and a cap.** Files aim at `target_file_size`: output
+  size is learned while writing and files close at the row-group boundary
+  nearest an even share, so the last file absorbs estimation error and can
+  be smaller. `max_file_size` (default 1.25 × the target) is a cap: before
+  each row group is written, the file's size with it is projected, counting
+  bloom filters and the footer that Parquet writes at close; a group whose
+  size is uncertain is encoded once in memory to measure it, and the file
+  closes first if it does not fit. A row group too large for any file is
+  split (the partition's `plan.note` says so). A file can exceed the cap
+  only if a row group is more than 1.5 times denser than the recent groups
+  and its own end slices, or a row group of 1,024 rows (or the configured
+  `row_group_size`, if smaller) is larger than the cap. On the
+  benchmark data (targets 32–512 MB, two row-group sizes) the largest file
+  was 0.98 × the cap. Raise `max_file_size` rather than accept smaller row
+  groups; measuring costs time only for groups near a file boundary.
+- **Guards.** With preserved settings, a partition whose result is not
+  smaller keeps its original files (copied with their names). A single file
+  with no keys is copied. `skip_unchanged=False` always compacts.
+- **Memory.** One worker handles one partition. The Arrow engine decodes the
+  whole partition, so budget about three times its decoded size; use
+  `engine="duckdb"` (with `memory_limit`) for partitions larger than memory.
+  Encoding a partition uses one core, so a single very large partition is
+  not parallelized; many partitions are.
+- **Existing data.** A destination partition that already holds Parquet
+  files is refused unless `overwrite=True`, which replaces that partition's
+  data files (others in the directory are deleted once the new set is
+  published).
+- **Resume.** Checkpoints work per partition. A `publishing` marker names
+  the outputs before they are moved into place; after a crash, a rerun
+  replaces that partial set without needing `overwrite`.
+
 ## Use every core of the worker
 
 Decoding, sorting and Parquet encoding each use about one core per file, so a

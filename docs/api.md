@@ -168,6 +168,9 @@ the dataset. It accepts the file rewrite controls above, plus:
 | `progress` | `None` | `progress(result, completed, total)` after each processed file |
 | `prefetch` | `max(2, workers)` remote, `0` local | Source files downloaded ahead of the workers that decode them |
 | `io_threads` | `4 * workers` for remote sources | Arrow's process-wide I/O pool size during the run; restored afterwards |
+| `scope` | `"file"` | `"partition"` sorts across all files of each leaf directory and writes new files |
+| `target_file_size` | `512 MiB` with `scope="partition"` | Approximate output file size: bytes or `"512MB"` |
+| `max_file_size` | `1.25 × target_file_size` | Cap: a file closes before a row group that would cross it |
 
 Preflight reads footers concurrently and lists the destination once instead
 of checking each output path. Threads scale because Arrow decoding, sorting
@@ -186,6 +189,19 @@ output, is processed again (an existing stale output needs `overwrite=True`).
 Hidden temporaries left beside this run's outputs by an interrupted run are
 deleted. On a failure, no new file starts, running files finish (and are
 checkpointed), and the first error is raised.
+
+With `scope="partition"`, the destination must be a new tree (neither the
+source nor an ancestor of it). Each leaf directory is sorted as one unit
+(stable: file order, then row order) and written as `part-00000.parquet`...
+files that close at the row-group boundary nearest an even share of the
+estimated output, and before any row group that would cross
+`max_file_size`. Row groups too large for the cap are split; the
+exceptions are documented in [cloud storage](cloud-storage.md). With preserved
+settings, a partition that would not shrink keeps its original files; a
+single file without keys is copied. A destination partition that already
+holds Parquet files needs `overwrite=True`, which replaces its data files.
+Shards, workers, checkpoints and `progress` work per partition; see
+[cloud storage](cloud-storage.md#compact-each-partition-into-fewer-sorted-files).
 
 Prefetched files are fetched whole, larger ones as concurrent 16 MiB ranges,
 and decoded from memory; their buffers count toward the live allocation the
@@ -227,6 +243,13 @@ Writer time includes destination publication, which is atomic locally but
 not a cloud bucket transaction. Guarded candidates retain attempted-stage
 costs even when their output is discarded. Reused plans report zero search
 time, not zero validation or sorting work.
+
+`PartitionResult` (in `DatasetRewriteResult.partitions` for
+`scope="partition"`) has `partition` (relative directory), `path`,
+`sources`, `outputs` (`WriteResult`s with action `"compacted"` or
+`"copied"`), `action`, `source_bytes`, `file_size`, `plan`, `resumed`, and
+the partition's stage timings. Output `WriteResult` timings are zero there:
+work is not attributable to one output file. `compacted_files` counts them.
 
 `DatasetRewriteResult.files` contains each file result in inventory order;
 convenience counts are `rewritten_files`, `copied_files`, `skipped_files`,

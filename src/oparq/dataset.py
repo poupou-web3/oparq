@@ -23,6 +23,7 @@ from .execution import (
     parse_size, resolve_budget, resolve_workers, run_tasks, stale_temporaries,
 )
 from .models import DatasetRewriteResult, RewritePlan, SortPlan, WriteResult
+from .compaction import DEFAULT_TARGET_FILE_SIZE, TARGET_TOLERANCE, rewrite_partitions
 from .sorting import unreorderable_columns
 from .storage import (
     ParquetInventory, compression_metadata, copy_file, hidden_sibling, inspect_compression,
@@ -402,6 +403,9 @@ def rewrite_dataset(
     progress: Callable[[WriteResult, int, int], None] | None = None,
     io_threads: int | None = None,
     prefetch: int | None = None,
+    scope: str = "file",
+    target_file_size: int | str | None = None,
+    max_file_size: int | str | None = None,
     **options: Any,
 ) -> DatasetRewriteResult:
     """Reuse one plan per input file, retaining every relative partition path.
@@ -422,6 +426,12 @@ def rewrite_dataset(
     ``progress(result, completed, total)`` is called after each file.
     For remote sources with several workers, Arrow's process-wide I/O thread
     pool is raised to ``io_threads`` (default ``4 * workers``) for the run.
+    ``scope="partition"`` instead sorts all files of each leaf directory
+    together and writes them as ``part-00000.parquet``... files of about
+    ``target_file_size`` (default 512 MiB), each closed before it is predicted
+    to cross ``max_file_size`` (default 1.25 x the target); the destination
+    must be a new tree, and ``progress`` receives a ``PartitionResult``. See
+    ``oparq.compaction``.
     ``prefetch`` downloads that many upcoming source files ahead of the
     workers that decode them (default: ``max(2, workers)`` for remote sources,
     ``0`` for local files), overlapping network transfer with CPU work. Files
@@ -444,6 +454,16 @@ def rewrite_dataset(
         raise ValueError("io_threads must be positive")
     if prefetch is not None and (isinstance(prefetch, bool) or prefetch < 0):
         raise ValueError("prefetch must be a non-negative number of files")
+    if scope not in {"file", "partition"}:
+        raise ValueError("scope must be 'file' or 'partition'")
+    if (target_file_size is not None or max_file_size is not None) and scope != "partition":
+        raise ValueError("target_file_size and max_file_size apply only to scope='partition'")
+    target_bytes = (parse_size(target_file_size) if target_file_size is not None
+                    else DEFAULT_TARGET_FILE_SIZE)
+    max_bytes = (parse_size(max_file_size) if max_file_size is not None
+                 else int(TARGET_TOLERANCE * target_bytes))
+    if max_bytes < target_bytes:
+        raise ValueError("max_file_size must not be smaller than target_file_size")
     if inventory.filesystem.equals(target.filesystem):
         source_root = inventory.root.rstrip("/")
         destination_root = target.path.rstrip("/")
@@ -475,8 +495,17 @@ def rewrite_dataset(
     listing = (target.filesystem.get_file_info(fs.FileSelector(target.path, recursive=True))
                if root_info.type == fs.FileType.Directory else [])
     existing = {info.path: info for info in listing}
-    files = [file for file in inventory.files if in_shard(inventory.relative_path(file), shard)]
     store = _checkpoint_store(checkpoint, target, destination_filesystem)
+    if scope == "partition":
+        return rewrite_partitions(
+            source=source, destination=destination, inventory=inventory, target=target, plan=plan,
+            options=options, engine=engine, workers=workers, budget=budget, shard=shard,
+            store=store, listing=listing, existing=existing, preserved=preserved,
+            overwrite=overwrite, progress=progress, io_threads=io_threads, prefetch=prefetch,
+            target_bytes=target_bytes, max_bytes=max_bytes, run_fingerprint=_run_fingerprint,
+            file_manifest=_file_manifest, source_identity=_source_identity,
+        )
+    files = [file for file in inventory.files if in_shard(inventory.relative_path(file), shard)]
     markers = store.load(inventory.relative_path(file) for file in files) if store else {}
 
     resumed: dict[str, WriteResult] = {}

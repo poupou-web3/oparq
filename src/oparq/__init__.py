@@ -12,6 +12,7 @@ from .models import (
     SortPlan,
     RewritePlan,
     DatasetRewriteResult,
+    PartitionResult,
     WriteResult,
 )
 from .planning import ALGORITHMS, plan_sort
@@ -25,6 +26,7 @@ __all__ = [
     "SortPlan",
     "RewritePlan",
     "DatasetRewriteResult",
+    "PartitionResult",
     "WriteResult",
     "apply_plan",
     "benchmark",
