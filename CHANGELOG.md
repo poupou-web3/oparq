@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Compact partitions: `rewrite_dataset(..., scope="partition", target_file_size="512MB")` / `--scope partition` sorts all files of each leaf directory together and writes them as fewer files of about the target size, capped by `max_file_size` / `--max-file-size` (default 1.25 × the target), into a new tree, with per-partition guards, checkpoints, shards and workers. Results are in `DatasetRewriteResult.partitions` (`PartitionResult`).
 - Rewrite dataset files concurrently: `workers=` / `--workers` runs files on a thread pool within a `memory_budget` that learns decoded bytes per row and checks live Arrow allocations. Outputs are byte-identical to serial runs.
 - Split a dataset across machines without overlap with `shard="i/N"` / `--shard`, using a stable hash of each relative path.
 - Resume interrupted rewrites from per-file checkpoint markers in `<destination>/_oparq/checkpoint` (on by default; `checkpoint=False` / `--no-checkpoint`). A marker is honored only when the source, plan keys, writer settings and output still match; leftover hidden temporaries are removed.

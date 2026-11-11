@@ -69,7 +69,10 @@ Tree rewrites (a directory to a directory) also accept:
 | `--shard INDEX/COUNT` | all files | Disjoint path-hash split for several machines |
 | `--checkpoint PATH` | `DESTINATION/_oparq/checkpoint` | Where per-file resume markers go |
 | `--no-checkpoint` | off | Write no markers and resume nothing |
-| `--progress` | off | One line per finished file on stderr |
+| `--progress` | off | One line per finished file (or partition) on stderr |
+| `--scope file\|partition` | `file` | `partition` sorts across each leaf directory's files into a new tree |
+| `--target-file-size SIZE` | `512MiB` | Approximate output file size for `--scope partition` |
+| `--max-file-size SIZE` | 1.25 × target | Size cap for `--scope partition` output files |
 
 Rerunning the same command resumes: files with a matching marker are counted
 as `resumed=` and not read again. These options are rejected for single-file

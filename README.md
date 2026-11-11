@@ -71,8 +71,10 @@ print(result.rewritten_files, result.copied_files, result.resumed_files)
 
 The saved plan skips future profiling and algorithm selection. Rewrites retain
 Parquet relative paths, Hive partition directories, and file boundaries,
-sorting within each physical file. They do not coalesce partitions, copy
-arbitrary sidecars, or provide a bucket-wide transaction. Files are rewritten
+sorting within each physical file; `scope="partition"` instead sorts across
+each directory's files and writes fewer files of a target size into a new
+tree. Rewrites do not copy arbitrary sidecars or provide a bucket-wide
+transaction. Files are rewritten
 concurrently within a memory budget, shards split a bucket across machines
 without overlap, and a rerun resumes from per-file checkpoint markers;
 `engine="duckdb"` (optional extra) bounds memory per file by spilling.

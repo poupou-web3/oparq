@@ -259,7 +259,15 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("--no-checkpoint", action="store_true",
                         help="do not record or resume finished files")
     tree.add_argument("--progress", action="store_true",
-                      help="print one line per finished file to stderr")
+                      help="print one line per finished file (or partition) to stderr")
+    tree.add_argument("--scope", choices=("file", "partition"), default="file",
+                      help="sort within each file (default), or across all files of each "
+                           "leaf directory and rewrite them as fewer files into a new tree")
+    tree.add_argument("--target-file-size", metavar="SIZE",
+                      help="approximate output file size for --scope partition (default: 512MiB)")
+    tree.add_argument("--max-file-size", metavar="SIZE",
+                      help="cap for --scope partition: files close before a row group predicted "
+                           "to cross it (default: 1.25 x the target)")
     rewrite_parser.add_argument(
         "--in-memory-sort", action="store_true",
         help="materialize the full reordered table instead of gathering row groups",
@@ -407,6 +415,12 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
             options["checkpoint"] = args.checkpoint
         if args.progress:
             options["progress"] = _print_progress
+        if args.scope != "file":
+            options["scope"] = args.scope
+        if args.target_file_size:
+            options["target_file_size"] = args.target_file_size
+        if args.max_file_size:
+            options["max_file_size"] = args.max_file_size
         result = rewrite(
             args.source,
             args.destination,
@@ -419,6 +433,24 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
             temp_directory=args.temp_directory, skip_unchanged=not args.force_rewrite,
             overwrite=args.overwrite,
         )
+        if isinstance(result, DatasetRewriteResult) and result.partitions:
+            shard = f" (shard {result.shard[0]}/{result.shard[1]})" if result.shard else ""
+            partitions = result.partitions
+            sources = sum(len(item.sources) for item in partitions)
+            before = sum(item.source_bytes for item in partitions)
+            after = sum(item.file_size for item in partitions)
+            print(f"partitions: {len(partitions)}{shard}; source files: {sources} -> "
+                  f"output files: {len(result.files)}; "
+                  f"compacted={sum(item.action == 'compacted' for item in partitions)} "
+                  f"copied={sum(item.action == 'copied' for item in partitions)} "
+                  f"resumed={sum(item.resumed for item in partitions)}")
+            if before:
+                print(f"bytes: {_bytes(before)} -> {_bytes(after)} ({after / before - 1:+.1%})")
+            if result.removed_temporaries:
+                print(f"removed {result.removed_temporaries} temporary object(s) "
+                      "left by an interrupted run")
+            print(f"output: {result.destination}")
+            return
         if isinstance(result, DatasetRewriteResult):
             shard = f" (shard {result.shard[0]}/{result.shard[1]})" if result.shard else ""
             print(f"files: {len(result.files)}{shard}; rewritten={result.rewritten_files} "

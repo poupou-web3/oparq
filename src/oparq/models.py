@@ -319,6 +319,36 @@ class WriteResult:
 
 
 @dataclass(frozen=True, slots=True)
+class PartitionResult:
+    """One partition directory rewritten with ``scope="partition"``.
+
+    Rows are sorted across all ``sources`` and written as ``outputs``
+    (``action="compacted"``), or the original files are kept because the
+    result was not smaller (``"copied"``). Timings cover the whole partition;
+    per-output ``WriteResult`` timings are zero because work is not
+    attributable to one output file.
+    """
+
+    partition: str
+    path: str
+    sources: tuple[str, ...]
+    outputs: tuple[WriteResult, ...]
+    action: str
+    source_bytes: int
+    plan: SortPlan
+    planning_seconds: float = 0.0
+    sort_seconds: float = 0.0
+    write_seconds: float = 0.0
+    permutation_seconds: float | None = None
+    gathering_seconds: float | None = None
+    resumed: bool = False
+
+    @property
+    def file_size(self) -> int:
+        return sum(item.file_size for item in self.outputs)
+
+
+@dataclass(frozen=True, slots=True)
 class DatasetRewriteResult:
     source: str
     destination: str
@@ -326,10 +356,17 @@ class DatasetRewriteResult:
     # Hidden temporaries of an interrupted earlier run that were deleted.
     removed_temporaries: int = 0
     shard: tuple[int, int] | None = None
+    # Per-partition results of a scope="partition" rewrite; ``files`` then
+    # lists every output file.
+    partitions: tuple[PartitionResult, ...] = ()
 
     @property
     def resumed_files(self) -> int:
         return sum(item.resumed for item in self.files)
+
+    @property
+    def compacted_files(self) -> int:
+        return sum(item.action == "compacted" for item in self.files)
 
     @property
     def rewritten_files(self) -> int:
